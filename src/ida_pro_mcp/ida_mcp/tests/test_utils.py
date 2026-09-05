@@ -6,6 +6,7 @@ from ..utils import (
     parse_address,
     normalize_list_input,
     normalize_dict_list,
+    require_bounded_batch,
     looks_like_address,
     get_function,
     get_prototype,
@@ -66,6 +67,17 @@ def test_utils_normalize_helpers():
     assert normalize_dict_list({"x": 1}) == [{"x": 1}]
     assert normalize_dict_list("a,b", lambda s: {"v": s}) == [{"v": "a"}, {"v": "b"}]
     assert normalize_dict_list('[{"x":1}]') == [{"x": 1}]
+
+
+@test()
+def test_utils_require_bounded_batch_fails_before_oversized_work():
+    """Batch guard accepts its boundary and rejects one item beyond it."""
+    assert require_bounded_batch(list(range(16)), "query") == list(range(16))
+    try:
+        require_bounded_batch(list(range(17)), "query")
+        assert False, "expected oversized batch to fail"
+    except ValueError as e:
+        assert "query batch has 17 items; maximum is 16" in str(e)
 
 
 @test(binary="crackme03.elf")

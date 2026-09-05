@@ -9,7 +9,7 @@ import uuid
 import threading
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Any, Callable, Dict, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -64,6 +64,7 @@ class IDASessionManager:
         input_path: Path | str,
         run_auto_analysis: bool = True,
         session_id: Optional[str] = None,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> str:
         """Open a binary file, activate it, and return its session ID."""
         input_path = Path(input_path)
@@ -84,6 +85,8 @@ class IDASessionManager:
                 raise ValueError(f"Session already exists: {session_id}")
 
             logger.info(f"Opening database: {input_path} (session: {session_id})")
+            if progress_callback is not None:
+                progress_callback("open")
             self._activate_database_path(str(input_path), run_auto_analysis)
 
             session = IDASession(
@@ -96,6 +99,8 @@ class IDASessionManager:
             self._active_session_id = session_id
 
             if run_auto_analysis:
+                if progress_callback is not None:
+                    progress_callback("autoanalysis")
                 logger.debug(
                     f"Waiting for auto-analysis to complete (session: {session_id})"
                 )

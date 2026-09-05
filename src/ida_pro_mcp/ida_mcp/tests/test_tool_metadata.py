@@ -221,6 +221,34 @@ def test_tool_params_no_bare_string_or_dict_fallback():
 
 
 @test()
+def test_large_batch_tools_use_list_only_input_schema():
+    """Avoid duplicating batch input objects in scalar-or-list unions."""
+    expected = {
+        "analyze_batch": "queries",
+        "entity_query": "queries",
+        "find": "targets",
+        "get_bytes": "regions",
+        "get_int": "queries",
+        "insn_query": "queries",
+        "lookup_funcs": "queries",
+        "read_struct": "queries",
+        "xref_query": "queries",
+        "xrefs_to_field": "queries",
+    }
+    matches = {
+        node.name: node
+        for _, node in _iter_tool_functions()
+        if node.name in expected
+    }
+    assert set(matches) == expected
+    for name, node in matches.items():
+        queries = dict(_iter_tool_arg_annotations(node))[expected[name]]
+        assert isinstance(queries, ast.Subscript), name
+        assert isinstance(queries.value, ast.Name), name
+        assert queries.value.id == "list", name
+
+
+@test()
 def test_tool_param_typed_dicts_have_required_core():
     """TypedDicts used as tool param shapes must declare a required core.
 

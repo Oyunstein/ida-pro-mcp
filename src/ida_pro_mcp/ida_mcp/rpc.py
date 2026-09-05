@@ -1,6 +1,9 @@
 import json
 import os
 from typing import Any, Optional
+
+from ida_pro_mcp.server_metadata import MCP_PACKAGE_VERSION, MCP_SERVER_INSTRUCTIONS
+
 from .zeromcp import (
     McpRpcRegistry,
     McpServer,
@@ -11,7 +14,12 @@ from .zeromcp import (
 
 MCP_UNSAFE: set[str] = set()
 MCP_EXTENSIONS: dict[str, set[str]] = {}  # group -> set of function names
-MCP_SERVER = McpServer("ida-pro-mcp", extensions=MCP_EXTENSIONS)
+MCP_SERVER = McpServer(
+    "ida-pro-mcp",
+    version=MCP_PACKAGE_VERSION,
+    instructions=MCP_SERVER_INSTRUCTIONS,
+    extensions=MCP_EXTENSIONS,
+)
 
 # ============================================================================
 # Output Size Limiting

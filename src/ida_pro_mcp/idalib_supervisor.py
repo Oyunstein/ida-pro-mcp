@@ -14,17 +14,22 @@ import importlib.util
 import json
 import logging
 import os
+import queue
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Callable, TypedDict
+
+from ida_pro_mcp.path_policy import normalize_input_path
+from ida_pro_mcp.server_metadata import MCP_PACKAGE_VERSION, MCP_SERVER_INSTRUCTIONS
 
 
 logger = logging.getLogger(__name__)
@@ -51,9 +56,13 @@ IDB_OPEN_MODES = {
 
 IDB_MANAGEMENT_TOOLS = {
     "idb_open",
+    "idb_open_status",
+    "idb_cancel_open",
     "idb_list",
     "idb_close",
 }
+
+OPEN_TERMINAL_STATES = frozenset({"ready", "failed", "cancelled"})
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -96,12 +105,16 @@ def _import_zeromcp():
     sys.path.insert(0, str(pkg_dir))
     try:
         from zeromcp import McpServer  # type: ignore
+        from zeromcp.jsonrpc import (  # type: ignore
+            RequestCancelledError,
+            get_current_cancel_event,
+        )
     finally:
         sys.path.remove(str(pkg_dir))
-    return McpServer
+    return McpServer, RequestCancelledError, get_current_cancel_event
 
 
-McpServer = _import_zeromcp()
+McpServer, RequestCancelledError, get_current_cancel_event = _import_zeromcp()
 
 
 def _import_discovery():
@@ -145,10 +158,23 @@ class IdalibSessionListInfo(IdalibSessionInfo, total=False):
     adopted: bool
     pid: int | None
     worker_pid: int | None
+    launcher_pid: int | None
+    state: str
+    phase: str
+    pending: bool
+    operation_id: str
+    updated_at: str
+    last_progress_at: str
+    last_heartbeat_at: str | None
+    idb_size_bytes: int
+    terminal_error: str | None
 
 
 class IdalibOpenResult(TypedDict, total=False):
     success: bool
+    session_id: str
+    state: str
+    operation: dict[str, Any]
     session: IdalibSessionInfo
     warmup: dict[str, Any] | None
     message: str
@@ -169,6 +195,12 @@ class IdalibCloseResult(TypedDict, total=False):
     saved: bool | None
     save_error: str
     message: str
+    error: str
+
+
+class IdalibOpenStatusResult(TypedDict, total=False):
+    success: bool
+    operation: dict[str, Any]
     error: str
 
 
@@ -209,7 +241,10 @@ class WorkerSession:
             "owned": self.owned,
             "adopted": True,
             "pid": self.pid,
-            "worker_pid": self.process.pid if self.process is not None else None,
+            "worker_pid": self.pid,
+            "launcher_pid": (
+                self.process.pid if self.process is not None else None
+            ),
         }
 
     def is_alive(self) -> bool:
@@ -219,6 +254,64 @@ class WorkerSession:
             except Exception:
                 return False
         return self.process is not None and self.process.poll() is None
+
+
+@dataclass
+class OpenOperation:
+    operation_id: str
+    session_id: str
+    input_path: str
+    filename: str
+    mode: str
+    run_auto_analysis: bool
+    build_caches: bool
+    init_hexrays: bool
+    idle_ttl_sec: int
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    last_progress_at: datetime = field(default_factory=datetime.now)
+    last_heartbeat_at: datetime | None = None
+    state: str = "opening"
+    phase: str = "spawn"
+    launcher_pid: int | None = None
+    worker_pid: int | None = None
+    idb_size_bytes: int = 0
+    terminal_error: str | None = None
+    cancel_requested_at: datetime | None = None
+    session: WorkerSession | None = field(default=None, repr=False)
+    worker: WorkerSession | None = field(default=None, repr=False)
+    preexisting_parts: set[Path] = field(default_factory=set, repr=False)
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    done_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    thread: threading.Thread | None = field(default=None, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "operation_id": self.operation_id,
+            "session_id": self.session_id,
+            "input_path": self.input_path,
+            "filename": self.filename,
+            "state": self.state,
+            "phase": self.phase,
+            "pending": self.state not in OPEN_TERMINAL_STATES,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "last_progress_at": self.last_progress_at.isoformat(),
+            "last_heartbeat_at": (
+                self.last_heartbeat_at.isoformat()
+                if self.last_heartbeat_at is not None
+                else None
+            ),
+            "launcher_pid": self.launcher_pid,
+            "worker_pid": self.worker_pid,
+            "idb_size_bytes": self.idb_size_bytes,
+            "terminal_error": self.terminal_error,
+            "cancel_requested_at": (
+                self.cancel_requested_at.isoformat()
+                if self.cancel_requested_at is not None
+                else None
+            ),
+        }
 
 
 class IdalibSupervisor:
@@ -234,6 +327,9 @@ class IdalibSupervisor:
         self.worker_args = worker_args or []
         self.sessions: dict[str, WorkerSession] = {}
         self.path_to_session: dict[str, str] = {}
+        self.open_operations: dict[str, OpenOperation] = {}
+        self.path_to_open_operation: dict[str, str] = {}
+        self._spawning_workers = 0
         self._schema_worker: WorkerSession | None = None
         self._tools_cache: dict[tuple[str, ...], list[dict]] = {}
         self._resources_cache: dict[str, list[dict]] = {}
@@ -248,7 +344,12 @@ class IdalibSupervisor:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
 
-    def _spawn_worker(self) -> WorkerSession:
+    def _spawn_worker(
+        self,
+        *,
+        on_spawn: Callable[[WorkerSession], None] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> WorkerSession:
         port = self._pick_port()
         cmd = [
             sys.executable,
@@ -286,19 +387,31 @@ class IdalibSupervisor:
             process=process,
             backend="worker",
             owned=True,
-            pid=process.pid,
+            pid=None,
         )
+        if on_spawn is not None:
+            on_spawn(worker)
         try:
-            self._wait_worker_ready(worker)
+            self._wait_worker_ready(worker, cancel_event=cancel_event)
         except Exception:
             self._terminate_worker(worker)
             raise
         return worker
 
-    def _wait_worker_ready(self, worker: WorkerSession, timeout: float = 120.0) -> None:
+    def _wait_worker_ready(
+        self,
+        worker: WorkerSession,
+        timeout: float = 120.0,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         deadline = time.monotonic() + timeout
         last_error: Exception | None = None
+        if cancel_event is None:
+            cancel_event = get_current_cancel_event()
         while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RequestCancelledError("Request was cancelled")
             if worker.process is not None and worker.process.poll() is not None:
                 raise RuntimeError(
                     f"idalib worker exited early with code {worker.process.returncode}"
@@ -377,6 +490,8 @@ class IdalibSupervisor:
             schema = self._schema_worker
             self.sessions.clear()
             self.path_to_session.clear()
+            self.open_operations.clear()
+            self.path_to_open_operation.clear()
             self._schema_worker = None
         if schema is not None:
             self._terminate_worker(schema)
@@ -385,6 +500,10 @@ class IdalibSupervisor:
         with self._lock:
             for worker in self.sessions.values():
                 if worker.backend == "worker" and worker.is_alive():
+                    return worker
+            for operation in self.open_operations.values():
+                worker = operation.worker
+                if worker is not None and worker.is_alive():
                     return worker
             if self._schema_worker is not None and self._schema_worker.is_alive():
                 return self._schema_worker
@@ -410,24 +529,55 @@ class IdalibSupervisor:
             if stale is not None:
                 self._terminate_worker(stale)
 
-    def _allocate_worker_locked(self) -> WorkerSession:
-        worker = self._take_schema_worker_for_session()
-        if worker is not None:
-            return worker
+    def _allocate_worker(
+        self,
+        *,
+        on_spawn: Callable[[WorkerSession], None] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> WorkerSession:
+        with self._lock:
+            worker = self._take_schema_worker_for_session()
+            if worker is not None:
+                return worker
 
-        self._prune_dead_worker_sessions_locked()
-        owned_workers = sum(
-            1
-            for session in self.sessions.values()
-            if session.backend == "worker" and session.owned and session.is_alive()
-        )
-        if self.max_workers <= 0 or owned_workers < self.max_workers:
-            return self._spawn_worker()
+            self._prune_dead_worker_sessions_locked()
+            owned_processes = {
+                session.process.pid
+                for session in self.sessions.values()
+                if session.backend == "worker"
+                and session.owned
+                and session.process is not None
+                and session.is_alive()
+            }
+            owned_processes.update(
+                operation.worker.process.pid
+                for operation in self.open_operations.values()
+                if operation.state not in OPEN_TERMINAL_STATES
+                and operation.worker is not None
+                and operation.worker.backend == "worker"
+                and operation.worker.owned
+                and operation.worker.process is not None
+                and operation.worker.is_alive()
+            )
+            owned_workers = len(owned_processes) + self._spawning_workers
+            if self.max_workers > 0 and owned_workers >= self.max_workers:
+                raise RuntimeError(
+                    f"Maximum idalib worker count reached ({self.max_workers}). "
+                    "Wait for an existing worker to be released or increase "
+                    "--max-workers."
+                )
+            self._spawning_workers += 1
 
-        raise RuntimeError(
-            f"Maximum idalib worker count reached ({self.max_workers}). "
-            "Wait for an existing worker to be released or increase --max-workers."
-        )
+        try:
+            if on_spawn is None and cancel_event is None:
+                return self._spawn_worker()
+            return self._spawn_worker(
+                on_spawn=on_spawn,
+                cancel_event=cancel_event,
+            )
+        finally:
+            with self._lock:
+                self._spawning_workers -= 1
 
     # ------------------------------------------------------------------
     # JSON-RPC forwarding
@@ -473,17 +623,77 @@ class IdalibSupervisor:
         arguments: dict[str, Any] | None = None,
         *,
         timeout: float | None = None,
+        cancel_event: threading.Event | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> Any:
-        response = self._worker_rpc(
-            worker,
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {"name": name, "arguments": arguments or {}},
-            },
-            timeout=timeout,
-        )
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments or {}},
+        }
+        if name == "idb_open" and cancel_event is None:
+            cancel_event = get_current_cancel_event()
+        if cancel_event is None:
+            response = self._worker_rpc(worker, payload, timeout=timeout)
+        else:
+            completed: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+            def run_worker_rpc() -> None:
+                try:
+                    completed.put((True, self._worker_rpc(worker, payload, timeout=timeout)))
+                except BaseException as exc:
+                    completed.put((False, exc))
+
+            rpc_thread = threading.Thread(
+                target=run_worker_rpc,
+                name=f"idalib-open-{worker.port}",
+                daemon=True,
+            )
+            rpc_thread.start()
+            next_progress_poll = time.monotonic()
+            while True:
+                try:
+                    succeeded, value = completed.get(timeout=0.05)
+                    if succeeded:
+                        response = value
+                        break
+                    if isinstance(value, BaseException):
+                        raise value
+                    raise RuntimeError("Worker RPC failed without an exception")
+                except queue.Empty:
+                    if not cancel_event.is_set():
+                        now = time.monotonic()
+                        if progress_callback is not None and now >= next_progress_poll:
+                            next_progress_poll = now + 1.0
+                            try:
+                                status = self.call_worker_tool(
+                                    worker,
+                                    "idb_open_status",
+                                    timeout=WORKER_QUICK_RPC_TIMEOUT_SEC,
+                                )
+                                progress_callback(
+                                    status if isinstance(status, dict) else {}
+                                )
+                            except Exception:
+                                progress_callback({})
+                        continue
+                    # The worker owns the in-progress IDA state. Reaping it is
+                    # the only bounded way to abort native auto-analysis and it
+                    # also releases the supervisor worker slot.
+                    self._terminate_worker(worker)
+                    rpc_thread.join(timeout=5.0)
+                    raise RequestCancelledError("Request was cancelled")
+        if name == "idb_open" and progress_callback is not None:
+            try:
+                status = self.call_worker_tool(
+                    worker,
+                    "idb_open_status",
+                    timeout=WORKER_QUICK_RPC_TIMEOUT_SEC,
+                )
+                progress_callback(status if isinstance(status, dict) else {})
+            except Exception:
+                progress_callback({})
         if "error" in response:
             raise RuntimeError(response["error"].get("message", "Unknown worker error"))
         result = response.get("result", {})
@@ -498,10 +708,7 @@ class IdalibSupervisor:
     # ------------------------------------------------------------------
 
     def _normalize_input_path(self, input_path: str) -> str:
-        path = Path(input_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Input file not found: {input_path}")
-        return str(path.resolve())
+        return str(normalize_input_path(input_path))
 
     def _path_key(self, path: str) -> str:
         return os.path.normcase(str(Path(path).resolve()))
@@ -808,6 +1015,323 @@ class IdalibSupervisor:
             )
             return session
 
+    @classmethod
+    def _database_footprint_bytes(cls, input_path: str) -> int:
+        path = Path(input_path)
+        candidates = set(cls._partial_database_paths(input_path))
+        if path.suffix.lower() in (".i64", ".idb"):
+            candidates.add(path)
+        else:
+            candidates.add(Path(str(path) + ".i64"))
+            candidates.add(Path(str(path) + ".idb"))
+        total = 0
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    total += candidate.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    def _update_open_progress(
+        self,
+        operation: OpenOperation,
+        worker_status: dict[str, Any],
+    ) -> None:
+        now = datetime.now()
+        size = self._database_footprint_bytes(operation.input_path)
+        phase = worker_status.get("phase")
+        worker_pid = worker_status.get("worker_pid")
+        if not isinstance(worker_pid, int):
+            worker_pid = None
+        if phase not in {
+            "open",
+            "autoanalysis",
+            "cache",
+            "hexrays",
+            "ready",
+            "failed",
+        }:
+            phase = None
+        with self._lock:
+            if self.open_operations.get(operation.operation_id) is not operation:
+                return
+            progressed = False
+            if phase is not None and phase != operation.phase:
+                operation.phase = phase
+                progressed = True
+            if phase is not None and operation.state != "cancelling":
+                next_state = (
+                    "analyzing"
+                    if phase in {"autoanalysis", "cache", "hexrays", "ready"}
+                    else "opening"
+                )
+                if next_state != operation.state:
+                    operation.state = next_state
+                    progressed = True
+            if size != operation.idb_size_bytes:
+                operation.idb_size_bytes = size
+                progressed = True
+            if worker_pid is not None and worker_pid != operation.worker_pid:
+                operation.worker_pid = worker_pid
+                if operation.worker is not None:
+                    operation.worker.pid = worker_pid
+                progressed = True
+            if worker_status:
+                operation.last_heartbeat_at = now
+            if progressed:
+                operation.last_progress_at = now
+            operation.updated_at = now
+
+    def _finish_open_operation(
+        self,
+        operation: OpenOperation,
+        *,
+        state: str,
+        phase: str,
+        session: WorkerSession | None = None,
+        error: str | None = None,
+    ) -> None:
+        now = datetime.now()
+        with self._lock:
+            if self.open_operations.get(operation.operation_id) is not operation:
+                return
+            operation.state = state
+            operation.phase = phase
+            operation.session = session
+            operation.terminal_error = error
+            operation.idb_size_bytes = self._database_footprint_bytes(
+                operation.input_path
+            )
+            operation.updated_at = now
+            operation.last_progress_at = now
+            operation.last_heartbeat_at = now
+            if session is not None:
+                operation.worker = session
+                operation.launcher_pid = (
+                    session.process.pid if session.process is not None else None
+                )
+                if operation.worker_pid is None:
+                    operation.worker_pid = session.pid
+            operation.done_event.set()
+
+    def _run_open_operation(self, operation: OpenOperation) -> None:
+        def worker_spawned(worker: WorkerSession) -> None:
+            now = datetime.now()
+            with self._lock:
+                if self.open_operations.get(operation.operation_id) is not operation:
+                    return
+                operation.worker = worker
+                operation.launcher_pid = (
+                    worker.process.pid if worker.process is not None else worker.pid
+                )
+                operation.phase = "spawn"
+                operation.updated_at = now
+                operation.last_progress_at = now
+                operation.last_heartbeat_at = now
+
+        def worker_allocated(worker: WorkerSession) -> None:
+            now = datetime.now()
+            with self._lock:
+                if self.open_operations.get(operation.operation_id) is not operation:
+                    return
+                operation.worker = worker
+                operation.launcher_pid = (
+                    worker.process.pid if worker.process is not None else worker.pid
+                )
+                operation.phase = "open"
+                operation.updated_at = now
+                operation.last_progress_at = now
+                operation.last_heartbeat_at = now
+
+        try:
+            session = self.open_session(
+                operation.input_path,
+                mode=operation.mode,
+                run_auto_analysis=operation.run_auto_analysis,
+                build_caches=operation.build_caches,
+                init_hexrays=operation.init_hexrays,
+                idle_ttl_sec=operation.idle_ttl_sec,
+                session_id=operation.session_id,
+                cancel_event=operation.cancel_event,
+                on_worker_spawned=worker_spawned,
+                on_worker_allocated=worker_allocated,
+                progress_callback=lambda status: self._update_open_progress(
+                    operation, status
+                ),
+            )
+            if operation.cancel_event.is_set():
+                with self._lock:
+                    if self.sessions.get(session.session_id) is session:
+                        self._unregister_session_locked(session.session_id)
+                self._terminate_worker(session)
+                self._cleanup_partial_database(
+                    operation.input_path,
+                    preserve=operation.preexisting_parts,
+                )
+                self._finish_open_operation(
+                    operation,
+                    state="cancelled",
+                    phase="cancelled",
+                    error="Open operation was cancelled",
+                )
+                return
+            self._finish_open_operation(
+                operation,
+                state="ready",
+                phase="ready",
+                session=session,
+            )
+        except RequestCancelledError as exc:
+            self._finish_open_operation(
+                operation,
+                state="cancelled",
+                phase="cancelled",
+                error=str(exc) or "Open operation was cancelled",
+            )
+        except Exception as exc:
+            terminal_state = "cancelled" if operation.cancel_event.is_set() else "failed"
+            self._finish_open_operation(
+                operation,
+                state=terminal_state,
+                phase=terminal_state,
+                error=str(exc),
+            )
+
+    def begin_open_session(
+        self,
+        input_path: str,
+        *,
+        mode: str = "prefer_headless",
+        run_auto_analysis: bool = True,
+        build_caches: bool = True,
+        init_hexrays: bool = True,
+        idle_ttl_sec: int = 600,
+        session_id: str | None = None,
+    ) -> OpenOperation:
+        request_cancel = get_current_cancel_event()
+        if request_cancel is not None and request_cancel.is_set():
+            raise RequestCancelledError("Request was cancelled")
+        if mode not in IDB_OPEN_MODES:
+            raise ValueError(
+                f"Unknown mode: {mode!r}. Expected one of: {sorted(IDB_OPEN_MODES)}."
+            )
+        resolved = self._normalize_input_path(input_path)
+        path_key = self._path_key(resolved)
+        operation_to_start: OpenOperation | None = None
+        with self._lock:
+            existing_operation_id = self.path_to_open_operation.get(path_key)
+            if existing_operation_id is not None:
+                existing_operation = self.open_operations.get(existing_operation_id)
+                if existing_operation is not None:
+                    if existing_operation.state in ("opening", "analyzing", "cancelling", "ready"):
+                        existing_operation.updated_at = datetime.now()
+                        return existing_operation
+                    self.path_to_open_operation.pop(path_key, None)
+                    self.open_operations.pop(existing_operation_id, None)
+
+            existing_session_id = self.path_to_session.get(path_key)
+            if existing_session_id is not None:
+                existing_session = self.sessions.get(existing_session_id)
+                if existing_session is not None and self._session_is_usable(existing_session):
+                    ready = OpenOperation(
+                        operation_id=existing_session.session_id,
+                        session_id=existing_session.session_id,
+                        input_path=resolved,
+                        filename=existing_session.filename,
+                        mode=mode,
+                        run_auto_analysis=run_auto_analysis,
+                        build_caches=build_caches,
+                        init_hexrays=init_hexrays,
+                        idle_ttl_sec=idle_ttl_sec,
+                        state="ready",
+                        phase="ready",
+                        session=existing_session,
+                        worker=existing_session,
+                        launcher_pid=(
+                            existing_session.process.pid
+                            if existing_session.process is not None
+                            else None
+                        ),
+                        worker_pid=existing_session.pid,
+                    )
+                    ready.done_event.set()
+                    self.open_operations[ready.operation_id] = ready
+                    self.path_to_open_operation[path_key] = ready.operation_id
+                    return ready
+                self._unregister_session_locked(existing_session_id)
+
+            chosen_session_id = session_id or str(uuid.uuid4())[:8]
+            existing_by_id = self.open_operations.get(chosen_session_id)
+            if existing_by_id is not None:
+                if self._path_key(existing_by_id.input_path) != path_key:
+                    raise ValueError(f"Session already exists: {chosen_session_id}")
+                if existing_by_id.state not in ("failed", "cancelled"):
+                    return existing_by_id
+                self.open_operations.pop(chosen_session_id, None)
+            existing_session = self.sessions.get(chosen_session_id)
+            if existing_session is not None:
+                raise ValueError(f"Session already exists: {chosen_session_id}")
+
+            operation_to_start = OpenOperation(
+                operation_id=chosen_session_id,
+                session_id=chosen_session_id,
+                input_path=resolved,
+                filename=Path(resolved).name,
+                mode=mode,
+                run_auto_analysis=run_auto_analysis,
+                build_caches=build_caches,
+                init_hexrays=init_hexrays,
+                idle_ttl_sec=idle_ttl_sec,
+                preexisting_parts=self._existing_partial_database_parts(resolved),
+            )
+            self.open_operations[chosen_session_id] = operation_to_start
+            self.path_to_open_operation[path_key] = chosen_session_id
+            thread = threading.Thread(
+                target=self._run_open_operation,
+                args=(operation_to_start,),
+                daemon=True,
+                name=f"idalib-open-operation-{chosen_session_id}",
+            )
+            operation_to_start.thread = thread
+
+        assert operation_to_start is not None
+        operation_to_start.thread.start()
+        return operation_to_start
+
+    def open_status(self, database: str) -> dict[str, Any]:
+        if not database:
+            raise RuntimeError(_DATABASE_REQUIRED_ERROR)
+        with self._lock:
+            operation = self.open_operations.get(database)
+            if operation is None:
+                raise RuntimeError(f"Open operation not found: {database}")
+            return operation.to_dict()
+
+    def cancel_open(self, database: str, *, wait_timeout: float = 10.0) -> dict[str, Any]:
+        if not database:
+            raise RuntimeError(_DATABASE_REQUIRED_ERROR)
+        with self._lock:
+            operation = self.open_operations.get(database)
+            if operation is None:
+                raise RuntimeError(f"Open operation not found: {database}")
+            if operation.state == "ready":
+                raise RuntimeError(
+                    f"Session '{database}' is ready; use idb_close to close it"
+                )
+            if operation.state in ("failed", "cancelled"):
+                return operation.to_dict()
+            operation.state = "cancelling"
+            operation.cancel_requested_at = datetime.now()
+            operation.updated_at = operation.cancel_requested_at
+            worker = operation.worker
+            operation.cancel_event.set()
+        if worker is not None:
+            self._terminate_worker(worker)
+        operation.done_event.wait(max(0.0, wait_timeout))
+        with self._lock:
+            return operation.to_dict()
+
     def open_session(
         self,
         input_path: str,
@@ -818,7 +1342,15 @@ class IdalibSupervisor:
         init_hexrays: bool = True,
         idle_ttl_sec: int = 600,
         session_id: str | None = None,
+        cancel_event: threading.Event | None = None,
+        on_worker_spawned: Callable[[WorkerSession], None] | None = None,
+        on_worker_allocated: Callable[[WorkerSession], None] | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> WorkerSession:
+        if cancel_event is None:
+            cancel_event = get_current_cancel_event()
+        if cancel_event is not None and cancel_event.is_set():
+            raise RequestCancelledError("Request was cancelled")
         if mode not in IDB_OPEN_MODES:
             raise ValueError(
                 f"Unknown mode: {mode!r}. Expected one of: {sorted(IDB_OPEN_MODES)}."
@@ -867,15 +1399,28 @@ class IdalibSupervisor:
                     if adopted is not None:
                         return adopted
 
-            if not break_for_launch:
-                worker = self._allocate_worker_locked()
-
         if break_for_launch:
             return self._launch_gui_and_adopt(resolved, session_id)
+
+        worker = self._allocate_worker(
+            on_spawn=on_worker_spawned,
+            cancel_event=cancel_event,
+        )
+        if on_worker_allocated is not None:
+            on_worker_allocated(worker)
+
+        if cancel_event is not None and cancel_event.is_set():
+            self._terminate_worker(worker)
+            raise RequestCancelledError("Request was cancelled")
 
         open_timeout = (WORKER_OPEN_TIMEOUT_SEC or None) if run_auto_analysis else None
         preexisting_parts = self._existing_partial_database_parts(resolved)
         try:
+            call_options: dict[str, Any] = {"timeout": open_timeout}
+            if cancel_event is not None:
+                call_options["cancel_event"] = cancel_event
+            if progress_callback is not None:
+                call_options["progress_callback"] = progress_callback
             opened = self.call_worker_tool(
                 worker,
                 "idb_open",
@@ -887,7 +1432,7 @@ class IdalibSupervisor:
                     "idle_ttl_sec": idle_ttl_sec,
                     "preferred_session_id": session_id,
                 },
-                timeout=open_timeout,
+                **call_options,
             )
             if isinstance(opened, dict) and opened.get("error"):
                 raise RuntimeError(str(opened["error"]))
@@ -923,7 +1468,7 @@ class IdalibSupervisor:
             process=worker.process,
             backend="worker",
             owned=True,
-            pid=worker.process.pid if worker.process is not None else None,
+            pid=worker.pid,
             last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
         )
         with self._lock:
@@ -982,8 +1527,7 @@ class IdalibSupervisor:
             session.session_id,
         )
         resolved = self._resolve_gui_fallback_path(session)
-        with self._lock:
-            worker = self._allocate_worker_locked()
+        worker = self._allocate_worker()
         preexisting_parts = self._existing_partial_database_parts(resolved)
         try:
             opened = self.call_worker_tool(
@@ -1016,7 +1560,7 @@ class IdalibSupervisor:
             process=worker.process,
             backend="worker",
             owned=True,
-            pid=worker.process.pid if worker.process is not None else None,
+            pid=worker.pid,
             last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
         )
         with self._lock:
@@ -1096,6 +1640,13 @@ class IdalibSupervisor:
         with self._lock:
             session = self.sessions.get(database)
             if session is None:
+                operation = self.open_operations.get(database)
+                if operation is not None:
+                    raise RuntimeError(
+                        f"Session '{database}' is {operation.state} in phase "
+                        f"'{operation.phase}'; use idb_open_status before calling "
+                        "database tools"
+                    )
                 raise RuntimeError(f"Session not found: {database}")
             session.last_accessed = datetime.now()
             return session
@@ -1106,6 +1657,23 @@ class IdalibSupervisor:
         Adopted GUI/worker instances (``owned`` is False) are detached rather
         than killed: they keep running so another supervisor can adopt them.
         """
+        with self._lock:
+            operation = self.open_operations.get(database)
+            pending = (
+                operation is not None
+                and operation.state not in OPEN_TERMINAL_STATES
+            )
+        if pending:
+            cancelled = self.cancel_open(database)
+            return {
+                "success": cancelled["state"] == "cancelled",
+                "session_id": database,
+                "backend": "worker",
+                "owned": True,
+                "saved": None,
+                "message": f"Pending open cancelled: {database}",
+            }
+
         session = self.peek_session(database)
         saved: bool | None = None
         save_error: str | None = None
@@ -1122,6 +1690,11 @@ class IdalibSupervisor:
         with self._lock:
             if self.sessions.get(database) is session:
                 self._unregister_session_locked(database)
+            operation = self.open_operations.pop(database, None)
+            if operation is not None:
+                path_key = self._path_key(operation.input_path)
+                if self.path_to_open_operation.get(path_key) == database:
+                    self.path_to_open_operation.pop(path_key, None)
         self._terminate_worker(session)
         if saved and session.owned:
             # The worker is SIGTERM'd without a clean close_database(), so the
@@ -1153,15 +1726,43 @@ class IdalibSupervisor:
         entry["busy"] = state == "busy"
         return entry
 
+    def _operation_list_entry(
+        self, operation: OpenOperation
+    ) -> IdalibSessionListInfo:
+        worker_alive = operation.worker is not None and operation.worker.is_alive()
+        status = operation.to_dict()
+        return {
+            "session_id": operation.session_id,
+            "input_path": operation.input_path,
+            "filename": operation.filename,
+            "created_at": operation.created_at.isoformat(),
+            "last_accessed": operation.updated_at.isoformat(),
+            "is_analyzing": operation.state == "analyzing",
+            "metadata": {"open_operation": status},
+            "is_active": worker_alive,
+            "busy": operation.state in ("analyzing", "cancelling"),
+            "backend": "worker",
+            "owned": True,
+            "adopted": True,
+            "pid": operation.worker_pid,
+            "worker_pid": operation.worker_pid,
+            "launcher_pid": operation.launcher_pid,
+            **status,
+        }
+
     def list_sessions(self) -> list[IdalibSessionListInfo]:
         with self._lock:
             adopted = [
                 self._session_list_entry(session) for session in self.sessions.values()
             ]
-            adopted_path_keys = {
-                key
-                for key in self.path_to_session
-            }
+            operation_entries = [
+                self._operation_list_entry(operation)
+                for operation in self.open_operations.values()
+                if operation.session_id not in self.sessions
+            ]
+            adopted_path_keys = set(self.path_to_session) | set(
+                self.path_to_open_operation
+            )
 
         unadopted: list[IdalibSessionListInfo] = []
         try:
@@ -1201,7 +1802,7 @@ class IdalibSupervisor:
                     "worker_pid": pid if backend == "worker" else None,
                 }
             )
-        return adopted + unadopted
+        return adopted + operation_entries + unadopted
 
     # ------------------------------------------------------------------
     # Schema/resource forwarding
@@ -1247,7 +1848,11 @@ class IdalibSupervisor:
         return copy.deepcopy(items)
 
 
-mcp = McpServer("ida-pro-mcp")
+mcp = McpServer(
+    "ida-pro-mcp",
+    version=MCP_PACKAGE_VERSION,
+    instructions=MCP_SERVER_INSTRUCTIONS,
+)
 supervisor: IdalibSupervisor | None = None
 _original_dispatch = mcp.registry.dispatch
 
@@ -1280,7 +1885,7 @@ def _jsonrpc_error(request_id: Any, code: int, message: str) -> dict | None:
 
 @mcp.tool
 def idb_open(
-    input_path: Annotated[str, "Path to the binary file to analyze"],
+    input_path: Annotated[str, "Absolute path to the binary file to analyze"],
     mode: Annotated[
         str,
         "How to open: prefer_headless (default; idalib worker, ignore GUI), "
@@ -1299,10 +1904,10 @@ def idb_open(
         str, "Preferred session ID (auto-generated if empty). Ignored if the file is already open in a GUI or worker session."
     ] = "",
 ) -> IdalibOpenResult:
-    """Open a binary and warm it up. Returns the existing session if the file is already open under the supervisor; otherwise creates one according to `mode`."""
+    """Start opening a binary and return a stable operation immediately."""
     sup = _require_supervisor()
     try:
-        session = sup.open_session(
+        operation = sup.begin_open_session(
             input_path,
             mode=mode,
             run_auto_analysis=run_auto_analysis,
@@ -1311,12 +1916,47 @@ def idb_open(
             idle_ttl_sec=idle_ttl_sec,
             session_id=preferred_session_id or None,
         )
-        return {
+        status = sup.open_status(operation.operation_id)
+        result: IdalibOpenResult = {
             "success": True,
-            "session": session.to_dict(),
-            "warmup": session.last_warmup,
-            "message": f"Binary opened: {session.filename} ({session.session_id})",
+            "session_id": operation.session_id,
+            "state": status["state"],
+            "operation": status,
+            "message": (
+                f"Binary open {status['state']}: {operation.filename} "
+                f"({operation.session_id}). Poll idb_open_status until ready."
+            ),
         }
+        if operation.session is not None:
+            result["session"] = operation.session.to_dict()
+            result["warmup"] = operation.session.last_warmup
+        return result
+    except RequestCancelledError:
+        raise
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool
+def idb_open_status(
+    database: Annotated[str, "Session ID returned by idb_open."],
+) -> IdalibOpenStatusResult:
+    """Return pending or terminal open-operation status."""
+    sup = _require_supervisor()
+    try:
+        return {"success": True, "operation": sup.open_status(database)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool
+def idb_cancel_open(
+    database: Annotated[str, "Pending session ID returned by idb_open."],
+) -> IdalibOpenStatusResult:
+    """Explicitly cancel a pending open and clean its newly created sidecars."""
+    sup = _require_supervisor()
+    try:
+        return {"success": True, "operation": sup.cancel_open(database)}
     except Exception as e:
         return {"error": str(e)}
 

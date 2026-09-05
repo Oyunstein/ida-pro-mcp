@@ -18,6 +18,7 @@ from .utils import (
     MemoryPatch,
     MemoryRead,
     normalize_list_input,
+    require_bounded_batch,
     parse_address,
     read_bytes_bss_safe,
     read_int_bss_safe,
@@ -69,10 +70,11 @@ class IntWriteResult(TypedDict):
 
 @tool
 @idasync
-def get_bytes(regions: list[MemoryRead] | MemoryRead) -> list[BytesReadResult]:
+def get_bytes(regions: list[MemoryRead]) -> list[BytesReadResult]:
     """Read bytes from memory addresses"""
     if isinstance(regions, dict):
         regions = [regions]
+    regions = require_bounded_batch(regions, "get_bytes")
 
     results = []
     for item in regions:
@@ -130,13 +132,14 @@ def _parse_int_value(text: str, signed: bool, bits: int) -> int:
 @idasync
 def get_int(
     queries: Annotated[
-        list[IntRead] | IntRead,
+        list[IntRead],
         "Integer read requests (ty, addr). ty: i8/u64/i16le/i16be/etc",
     ],
 ) -> list[IntReadResult]:
     """Read integer values from memory addresses"""
     if isinstance(queries, dict):
         queries = [queries]
+    queries = require_bounded_batch(queries, "get_int")
 
     results = []
     for item in queries:

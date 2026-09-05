@@ -122,6 +122,7 @@ INITIALIZE_RESULT_SCHEMA: dict[str, Any] = {
     "properties": {
         "protocolVersion": {"type": "string", "minLength": 1},
         "capabilities": {"type": "object"},
+        "instructions": {"type": "string", "minLength": 1},
         "serverInfo": {
             "type": "object",
             "properties": {

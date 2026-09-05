@@ -120,6 +120,22 @@ def test_decompile_include_addresses_false_strips_markers():
     assert "/*0x" not in result["code"]
 
 
+@test(binary="crackme03.elf")
+def test_decompile_paginates_lines_with_cursor():
+    """decompile returns a bounded page and an exact continuation cursor."""
+    first = decompile("main", include_addresses=False, max_lines=1)
+    assert_ok(first, "code")
+    assert first["line_count"] == 1
+    assert first["total_lines"] > 1
+    assert first["cursor"] == {"next": 1}
+
+    second = decompile("main", include_addresses=False, offset=1, max_lines=1)
+    assert_ok(second, "code")
+    assert second["line_count"] == 1
+    assert second["total_lines"] == first["total_lines"]
+    assert second["code"] != first["code"]
+
+
 @test()
 def test_disasm_valid_function():
     """disasm returns non-empty assembly for a valid function."""
@@ -801,6 +817,38 @@ def test_func_profile():
 
 
 @test()
+def test_analyze_batch_lean_defaults():
+    """analyze_batch skips optional relationship and listing work by default"""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = analyze_batch({"addr": fn_addr})
+    assert_is_list(result, min_length=1)
+    r = result[0]
+    assert_has_keys(r, "target", "addr", "name", "analysis", "error")
+    if r["analysis"] is not None:
+        a = r["analysis"]
+        assert set(a) == {"size", "prototype"}
+
+
+@test()
+def test_analyze_batch_can_omit_all_optional_sections():
+    """analyze_batch emits no placeholders for explicitly disabled sections"""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    result = analyze_batch(
+        {"addr": fn_addr, "include_decompile": False, "include_proto": False}
+    )
+    assert_is_list(result, min_length=1)
+    r = result[0]
+    if r["analysis"] is not None:
+        assert set(r["analysis"]) == {"size"}
+
+
+@test()
 def test_analyze_batch():
     """analyze_batch returns structured analysis for a function"""
     fn_addr = get_any_function()
@@ -810,8 +858,12 @@ def test_analyze_batch():
     result = analyze_batch(
         {
             "addr": fn_addr,
+            "include_decompile": True,
             "include_disasm": True,
             "max_disasm_insns": 16,
+            "include_xrefs": True,
+            "include_callers": True,
+            "include_callees": True,
             "include_strings": True,
             "max_strings": 16,
             "include_constants": True,

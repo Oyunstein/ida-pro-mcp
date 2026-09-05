@@ -4,6 +4,7 @@ import os
 import signal
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
@@ -21,6 +22,7 @@ from ida_pro_mcp.ida_mcp.mainthread import get_pump
 from ida_pro_mcp.ida_mcp.profile import apply_profile, load_profile
 from ida_pro_mcp.ida_mcp.rpc import set_download_base_url, tool
 from ida_pro_mcp.idalib_session_manager import get_session_manager
+from ida_pro_mcp.path_policy import normalize_input_path
 from ida_pro_mcp.worker_lifecycle import WorkerLifecycle
 
 
@@ -56,6 +58,7 @@ logger = logging.getLogger(__name__)
 
 IDB_MANAGEMENT_TOOLS = {
     "idb_open",
+    "idb_open_status",
     "idb_list",
 }
 
@@ -65,6 +68,44 @@ _PUMP = get_pump()
 _REGISTERED_PORT: int | None = None
 _BOUND_HOST: str = ""
 _BOUND_PORT: int = 0
+_OPEN_STATUS_LOCK = threading.Lock()
+_OPEN_STATUS: dict[str, Any] = {
+    "worker_pid": os.getpid(),
+    "state": "idle",
+    "phase": "idle",
+    "updated_at": datetime.now().isoformat(),
+    "session_id": None,
+    "input_path": None,
+    "terminal_error": None,
+}
+
+
+def _set_open_status(
+    phase: str,
+    *,
+    state: str | None = None,
+    session_id: str | None = None,
+    input_path: str | None = None,
+    terminal_error: str | None = None,
+    reset_identity: bool = False,
+) -> None:
+    with _OPEN_STATUS_LOCK:
+        _OPEN_STATUS["phase"] = phase
+        _OPEN_STATUS["updated_at"] = datetime.now().isoformat()
+        if state is not None:
+            _OPEN_STATUS["state"] = state
+        if reset_identity or session_id is not None:
+            _OPEN_STATUS["session_id"] = session_id
+        if reset_identity or input_path is not None:
+            _OPEN_STATUS["input_path"] = input_path
+        _OPEN_STATUS["terminal_error"] = terminal_error
+
+
+@tool
+def idb_open_status() -> dict[str, Any]:
+    """Return worker-local open progress without entering the IDA main thread."""
+    with _OPEN_STATUS_LOCK:
+        return dict(_OPEN_STATUS)
 
 
 def _register_in_discovery(host: str, port: int, input_path: Path) -> None:
@@ -97,7 +138,7 @@ def _deregister_from_discovery() -> None:
 
 @tool
 def idb_open(
-    input_path: Annotated[str, "Path to the binary file to analyze"],
+    input_path: Annotated[str, "Absolute path to the binary file to analyze"],
     run_auto_analysis: Annotated[bool, "Run automatic analysis on the binary"] = True,
     build_caches: Annotated[bool, "Build core caches after open"] = True,
     init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler after open"] = True,
@@ -128,24 +169,67 @@ def idb_open(
 
     try:
         manager = get_session_manager()
-        resolved_path = Path(input_path).resolve()
+        resolved_path = normalize_input_path(input_path)
+        requested_session_id = preferred_session_id or None
+        _set_open_status(
+            "open",
+            state="opening",
+            session_id=requested_session_id,
+            input_path=str(resolved_path),
+            reset_identity=True,
+        )
         load_started_at = time.monotonic()
         opened_session_id = manager.open_binary(
             resolved_path,
             run_auto_analysis=run_auto_analysis,
-            session_id=preferred_session_id or None,
+            session_id=requested_session_id,
+            progress_callback=lambda phase: _set_open_status(
+                phase,
+                state="analyzing" if phase == "autoanalysis" else "opening",
+                session_id=requested_session_id,
+                input_path=str(resolved_path),
+            ),
         )
         session = manager.activate_session(opened_session_id)
         warmup: ServerWarmupResult | None = None
-        if build_caches or init_hexrays:
-            warmup = server_warmup(
+        warmup_steps: list[dict[str, Any]] = []
+        warmup_health: dict[str, Any] = {}
+        warmup_ok = True
+        if build_caches:
+            _set_open_status("cache", state="analyzing")
+            cache_result = server_warmup(
                 wait_auto_analysis=False,
-                build_caches=build_caches,
-                init_hexrays=init_hexrays,
+                build_caches=True,
+                init_hexrays=False,
             )
+            warmup_steps.extend(cache_result["steps"])
+            warmup_health = cache_result["health"]
+            warmup_ok = warmup_ok and cache_result["ok"]
+        if init_hexrays:
+            _set_open_status("hexrays", state="analyzing")
+            hexrays_result = server_warmup(
+                wait_auto_analysis=False,
+                build_caches=False,
+                init_hexrays=True,
+            )
+            warmup_steps.extend(hexrays_result["steps"])
+            warmup_health = hexrays_result["health"]
+            warmup_ok = warmup_ok and hexrays_result["ok"]
+        if build_caches or init_hexrays:
+            warmup = {
+                "ok": warmup_ok,
+                "steps": warmup_steps,
+                "health": warmup_health,
+            }
         _LIFECYCLE.set_idle_ttl(float(idle_ttl_sec), time.monotonic() - load_started_at)
         if _REGISTERED_PORT is None and _BOUND_HOST and _BOUND_PORT:
             _register_in_discovery(_BOUND_HOST, _BOUND_PORT, session.input_path)
+        _set_open_status(
+            "ready",
+            state="ready",
+            session_id=opened_session_id,
+            input_path=str(session.input_path),
+        )
         return {
             "success": True,
             "session": session.to_dict(),
@@ -155,8 +239,10 @@ def idb_open(
             ),
         }
     except (FileNotFoundError, RuntimeError, ValueError) as e:
+        _set_open_status("failed", state="failed", terminal_error=str(e))
         return {"error": str(e)}
     except Exception as e:
+        _set_open_status("failed", state="failed", terminal_error=str(e))
         return {"error": f"Unexpected error: {e}"}
 
 
@@ -238,11 +324,8 @@ def main():
     session_manager = get_session_manager()
 
     if args.input_path is not None:
-        if not args.input_path.exists():
-            raise FileNotFoundError(f"Input file not found: {args.input_path}")
-
-        logger.info("opening initial database: %s", args.input_path)
-        resolved = args.input_path.resolve()
+        resolved = normalize_input_path(args.input_path)
+        logger.info("opening initial database: %s", resolved)
         session_id = session_manager.open_binary(resolved, run_auto_analysis=True)
         logger.info("Initial session created: %s", session_id)
         _register_in_discovery(args.host, args.port, resolved)

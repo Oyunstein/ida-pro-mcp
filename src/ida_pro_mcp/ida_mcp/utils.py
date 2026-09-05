@@ -171,7 +171,7 @@ class XrefQuery(TypedDict):
     direction: NotRequired[Annotated[str, "to|from|both (default: both)"]]
     xref_type: NotRequired[Annotated[str, "any|code|data (default: any)"]]
     offset: NotRequired[Annotated[int, "Start index (default: 0)"]]
-    count: NotRequired[Annotated[int, "Max results (default: 200, max: 5000)"]]
+    count: NotRequired[Annotated[int, "Max results (default: 64, max: 512)"]]
     include_fn: NotRequired[Annotated[bool, "Include function metadata"]]
     dedup: NotRequired[Annotated[bool, "Deduplicate by addr/type"]]
     sort_by: NotRequired[Annotated[str, "Sort: addr|type"]]
@@ -211,7 +211,7 @@ class EntityQuery(TypedDict):
     segment: NotRequired[Annotated[str, "Segment filter"]]
     module: NotRequired[Annotated[str, "Import module filter"]]
     offset: NotRequired[Annotated[int, "Start index"]]
-    count: NotRequired[Annotated[int, "Max results (0=all)"]]
+    count: NotRequired[Annotated[int, "Max results (default: 64, max: 512)"]]
     sort_by: NotRequired[Annotated[str, "Sort: addr|name|size|length"]]
     descending: NotRequired[Annotated[bool, "Descending"]]
     fields: NotRequired[Annotated[list[str], "Projection field list"]]
@@ -238,15 +238,26 @@ class AnalyzeBatchQuery(TypedDict):
     """Comprehensive function analysis request"""
 
     addr: Annotated[str, "Function address or name"]
-    include_decompile: NotRequired[Annotated[bool, "Include decompiler output"]]
-    include_disasm: NotRequired[Annotated[bool, "Include disassembly"]]
-    include_xrefs: NotRequired[Annotated[bool, "Include xrefs-to/from"]]
-    include_callers: NotRequired[Annotated[bool, "Include callers"]]
-    include_callees: NotRequired[Annotated[bool, "Include callees"]]
-    include_strings: NotRequired[Annotated[bool, "Include strings"]]
-    include_constants: NotRequired[Annotated[bool, "Include constants"]]
-    include_basic_blocks: NotRequired[Annotated[bool, "Include basic blocks"]]
-    include_proto: NotRequired[Annotated[bool, "Include prototype"]]
+    include_decompile: NotRequired[
+        Annotated[bool, "Include decompiler output (default: false)"]
+    ]
+    include_disasm: NotRequired[
+        Annotated[bool, "Include disassembly (default: false)"]
+    ]
+    include_xrefs: NotRequired[
+        Annotated[bool, "Include xrefs-to/from (default: false)"]
+    ]
+    include_callers: NotRequired[Annotated[bool, "Include callers (default: false)"]]
+    include_callees: NotRequired[Annotated[bool, "Include callees (default: false)"]]
+    include_strings: NotRequired[Annotated[bool, "Include strings (default: false)"]]
+    include_constants: NotRequired[
+        Annotated[bool, "Include constants (default: false)"]
+    ]
+    include_basic_blocks: NotRequired[
+        Annotated[bool, "Include basic blocks (default: false)"]
+    ]
+    include_proto: NotRequired[Annotated[bool, "Include prototype (default: true)"]]
+    max_decompile_lines: NotRequired[Annotated[int, "Max decompile lines (max: 1000)"]]
     max_disasm_insns: NotRequired[Annotated[int, "Max disasm instructions"]]
     max_callers: NotRequired[Annotated[int, "Max callers"]]
     max_callees: NotRequired[Annotated[int, "Max callees"]]
@@ -324,8 +335,8 @@ class InsnPattern(TypedDict, total=False):
     start: Annotated[str, "Scope: start address"]
     end: Annotated[str, "Scope: end address (exclusive)"]
     offset: Annotated[int, "Start index"]
-    count: Annotated[int, "Max matches (max: 5000)"]
-    max_scan_insns: Annotated[int, "Max instructions to scan"]
+    count: Annotated[int, "Max matches (default: 64, max: 512)"]
+    max_scan_insns: Annotated[int, "Max instructions to scan (default: 50000, max: 250000)"]
     include_fn: Annotated[bool, "Include function metadata"]
     include_disasm: Annotated[bool, "Include disassembly text"]
     allow_broad: Annotated[bool, "Allow scopeless scan"]
@@ -668,6 +679,21 @@ def normalize_list_input(value: list | str) -> list:
     if isinstance(value, str):
         return [item.strip() for item in value.split(",") if item.strip()]
     return [value]
+
+
+TBatchItem = TypeVar("TBatchItem")
+
+
+def require_bounded_batch(
+    items: list[TBatchItem], subject: str, maximum: int = 16
+) -> list[TBatchItem]:
+    """Fail before analysis when one request multiplies bounded per-item work."""
+    if len(items) > maximum:
+        raise ValueError(
+            f"{subject} batch has {len(items)} items; maximum is {maximum}. "
+            "Split the request into smaller batches."
+        )
+    return items
 
 
 def normalize_dict_list(

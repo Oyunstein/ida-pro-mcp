@@ -10,13 +10,14 @@ import ipaddress
 import inspect
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
 from typing import Any, Callable, Union, Annotated, BinaryIO, NotRequired, get_origin, get_args, get_type_hints, is_typeddict
 from types import UnionType
 from urllib.parse import urlparse, parse_qs, urlunparse
 from io import BufferedIOBase
 
-from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, get_current_request_id, register_pending_request, unregister_pending_request, cancel_request
+from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, RequestCancelledError, cancel_request, get_current_request_id, register_pending_request, reserve_pending_request, unregister_pending_request
 
 EXTERNAL_BASE_HEADER = "X-IDA-MCP-External-Base"
 
@@ -760,9 +761,17 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             send_response(200, json.dumps(response).encode("utf-8"))
 
 class McpServer:
-    def __init__(self, name: str, version = "1.0.0", *, extensions: dict[str, set[str]] | None = None):
+    def __init__(
+        self,
+        name: str,
+        version="1.0.0",
+        *,
+        instructions: str | None = None,
+        extensions: dict[str, set[str]] | None = None,
+    ):
         self.name = name
         self.version = version
+        self.instructions = instructions
         self.cors_allowed_origins: Callable[[str], bool] | list[str] | str | None = self.cors_localhost
         self.post_body_limit = 10 * 1024 * 1024  # 10MB
         self.tools = McpRpcRegistry()
@@ -932,27 +941,93 @@ class McpServer:
     def stdio(self, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None):
         stdin = stdin or sys.stdin.buffer
         stdout = stdout or sys.stdout.buffer
-        while True:
+        write_lock = threading.Lock()
+
+        def write_response(response):
+            if response is None:
+                return
+            with write_lock:
+                stdout.write(json.dumps(response).encode("utf-8") + b"\n")
+                stdout.flush()
+
+        def dispatch_request(request, request_id, cancel_event):
+            setattr(self._transport_session_id, "data", "stdio:default")
             try:
-                request = stdin.readline()
-                if not request: # EOF
-                    break
+                response = self.registry.dispatch(request)
+                # MCP cancellation marks the result as unused. In particular,
+                # do not emit a late result or cancellation error after the
+                # notification has been accepted.
+                if cancel_event is None or not cancel_event.is_set():
+                    write_response(response)
+            finally:
+                setattr(self._transport_session_id, "data", None)
+                if request_id is not None:
+                    unregister_pending_request(request_id)
 
-                # Strip whitespace (trailing newline) before parsing
-                request = request.strip()
-                if not request:
-                    continue
-
-                setattr(self._transport_session_id, "data", "stdio:default")
+        # Keep a bounded control plane available while one request is waiting
+        # on a long worker operation. Writes remain serialized and the reader
+        # continues to deliver notifications/cancelled inline.
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="mcp-stdio") as executor:
+            while True:
                 try:
-                    response = self.registry.dispatch(request)
-                finally:
-                    setattr(self._transport_session_id, "data", None)
-                if response is not None:
-                    stdout.write(json.dumps(response).encode("utf-8") + b"\n")
-                    stdout.flush()
-            except (BrokenPipeError, KeyboardInterrupt): # Client disconnected
-                break
+                    request = stdin.readline()
+                    if not request: # EOF
+                        break
+
+                    # Strip whitespace (trailing newline) before parsing
+                    request = request.strip()
+                    if not request:
+                        continue
+
+                    request_obj = None
+                    try:
+                        parsed = json.loads(request)
+                        if isinstance(parsed, dict):
+                            request_obj = parsed
+                    except Exception:
+                        pass
+
+                    method = request_obj.get("method") if request_obj is not None else None
+                    is_notification = request_obj is not None and "id" not in request_obj
+                    if is_notification:
+                        setattr(self._transport_session_id, "data", "stdio:default")
+                        try:
+                            write_response(self.registry.dispatch(request))
+                        finally:
+                            setattr(self._transport_session_id, "data", None)
+                        continue
+
+                    # Initialization is ordered before every later message and
+                    # the MCP specification forbids cancelling it.
+                    if method == "initialize":
+                        setattr(self._transport_session_id, "data", "stdio:default")
+                        try:
+                            write_response(self.registry.dispatch(request))
+                        finally:
+                            setattr(self._transport_session_id, "data", None)
+                        continue
+
+                    request_id = request_obj.get("id") if request_obj is not None else None
+                    if not isinstance(request_id, (int, float, str)):
+                        request_id = None
+                    cancel_event = (
+                        reserve_pending_request(request_id)
+                        if request_id is not None
+                        else None
+                    )
+                    try:
+                        executor.submit(
+                            dispatch_request,
+                            request,
+                            request_id,
+                            cancel_event,
+                        )
+                    except Exception:
+                        if request_id is not None:
+                            unregister_pending_request(request_id)
+                        raise
+                except (BrokenPipeError, KeyboardInterrupt): # Client disconnected
+                    break
 
     def get_current_transport_session_id(self) -> str | None:
         return getattr(self._transport_session_id, "data", None)
@@ -1001,7 +1076,7 @@ class McpServer:
 
     def _mcp_initialize(self, protocolVersion: str, capabilities: dict, clientInfo: dict, _meta: dict | None = None) -> dict:
         """MCP initialize method"""
-        return {
+        result = {
             "protocolVersion": getattr(self._protocol_version, "data", protocolVersion),
             "capabilities": {
                 "tools": {},
@@ -1016,6 +1091,9 @@ class McpServer:
                 "version": self.version,
             },
         }
+        if self.instructions:
+            result["instructions"] = self.instructions
+        return result
 
     def _mcp_tools_list(self, _meta: dict | None = None) -> dict:
         """MCP tools/list method"""
@@ -1064,6 +1142,10 @@ class McpServer:
             # Check for error response
             if tool_response and "error" in tool_response:
                 error = tool_response["error"]
+                if error.get("code") == -32800:
+                    raise RequestCancelledError(
+                        error.get("message") or "Request cancelled"
+                    )
                 return {
                     "content": [{"type": "text", "text": error.get("message", "Unknown error")}],
                     "isError": True,
@@ -1083,7 +1165,7 @@ class McpServer:
         """MCP notifications/initialized - client signals initialization complete"""
         # Notifications don't return a response
 
-    def _mcp_notifications_cancelled(self, requestId: int | str, reason: str | None = None) -> None:
+    def _mcp_notifications_cancelled(self, requestId: int | float | str, reason: str | None = None) -> None:
         """MCP notifications/cancelled - cancel an in-flight request"""
         if cancel_request(requestId):
             logger.info(

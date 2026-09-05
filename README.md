@@ -199,6 +199,27 @@ For stdio-based clients, use:
 uv run idalib-mcp --stdio
 ```
 
+The STDIO reader uses a bounded request pool, so `idb_list`, open-status, ping,
+and cancellation requests remain serviceable while another request is waiting
+on a worker. It also accepts the standard MCP `notifications/cancelled` message
+for in-flight requests.
+
+`idb_open` is asynchronous: it reserves a stable session ID and returns an
+`opening` or `analyzing` operation without waiting for auto-analysis, cache
+construction, or Hex-Rays initialization. Poll `idb_open_status` until the
+operation is `ready`, `failed`, or `cancelled`. Repeating `idb_open` with the
+same normalized path or preferred session while it is pending returns the same
+operation and never spawns another worker. A client-side timeout or lost
+response does not cancel that operation; query the stable ID again. Only
+`idb_cancel_open` explicitly reaps an owned pending worker and removes partial
+database sidecars created by that attempt.
+
+The MCP initialize response reports the installed `ida-pro-mcp` distribution
+version and supplies concise server instructions for the absolute-path,
+explicit-session, analysis-barrier, readiness, profile, and close workflow.
+Clients that support MCP server instructions can use this guidance before
+choosing a tool.
+
 Database workers are persistent: each one runs as a detached process that
 outlives the supervisor that spawned it. When a new supervisor (over stdio
 or HTTP) calls `idb_open` for a binary that is already open under a worker
@@ -228,22 +249,40 @@ uv run idalib-mcp --stdio --max-workers 4
 Typical flow:
 
 ```python
-idb_open("/path/to/binary_a.exe", preferred_session_id="binary_a")
-idb_open("/path/to/library.dll", preferred_session_id="library")
+import time
+
+opened = idb_open("/path/to/binary_a.exe", preferred_session_id="binary_a")
+while idb_open_status(database=opened["session_id"])["operation"]["state"] not in {
+    "ready", "failed", "cancelled"
+}:
+    time.sleep(2)
 
 decompile("main", database="binary_a")
-xrefs_to("ImportantExport", database="library")
 ```
+
+`input_path` must be an absolute path. MCP clients and stdio servers do not
+necessarily share a working directory, so `idb_open` rejects relative paths
+instead of resolving them against the server process. Resolve and validate the
+path in the client before calling the tool.
 
 `database` must be the session ID returned by `idb_open` (or shown in `idb_list`); filenames and paths are not accepted.
 
 ### Management tools
 
-- `idb_open(input_path, mode="prefer_headless", run_auto_analysis=True, build_caches=True, init_hexrays=True, preferred_session_id="")`: Open a binary, warm up subsystems (strings cache, Hex-Rays), and return its session ID. If a worker or GUI for this path is already running on the host, that instance is adopted and `preferred_session_id` is ignored.
-- `idb_list()`: List open sessions and running GUI IDA instances. Each entry has `adopted` (True if this supervisor manages it, False for GUIs/workers discovered but not yet opened via `idb_open`), `backend` (`worker` or `gui`), `is_active`, and process IDs.
+- `idb_open(input_path, mode="prefer_headless", run_auto_analysis=True, build_caches=True, init_hexrays=True, preferred_session_id="")`: Reserve an idempotent open operation and return immediately. The result contains `session_id`, `state`, and an operation snapshot.
+- `idb_open_status(database)`: Return phase (`spawn`, `open`, `autoanalysis`, `cache`, `hexrays`, or a terminal phase), worker PID, heartbeat/progress timestamps, observed database size, and terminal error.
+- `idb_cancel_open(database)`: Explicitly cancel a pending owned-worker open. Cancellation reaps the worker and preserves sidecars that existed before the attempt.
+- `idb_list()`: List pending operations, open sessions, and running GUI IDA instances. Each entry has `adopted` (True if this supervisor manages it, False for GUIs/workers discovered but not yet opened via `idb_open`), `backend` (`worker` or `gui`), `is_active`, and process IDs.
 - `idb_close(database, save=True)`: Save (optionally), unregister the session, and terminate its owned worker, freeing a slot toward `--max-workers`. Adopted GUI/worker instances are detached, not killed.
 - `idb_save(session_id, path="")`: Save a session's IDB to disk. Forwarded as a regular worker tool (`database=<id>` injected) — same signature in both backends.
-- Per-database health: call `server_health(database=<id>)` (forwarded). `idb_list()` reports `is_active` from the supervisor's TCP/RPC probe.
+- Per-database health: call `server_health(database=<id>)` (forwarded).
+  `status="ok"` confirms that the worker can answer, while `ready=true`
+  additionally requires an empty auto-analysis queue, initialized strings
+  cache, and available Hex-Rays. The payload includes the auto-analysis state
+  and a machine-readable `not_ready_reasons` list. Call
+  `analysis_barrier(database=<id>)` when a workflow needs an explicit
+  auto-analysis synchronization point before its final health check.
+  `idb_list()` reports `is_active` from the supervisor's TCP/RPC probe.
 
 Worker controls:
 

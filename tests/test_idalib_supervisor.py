@@ -1,11 +1,14 @@
 """idalib supervisor tests that do not require IDA/idalib."""
 
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from ida_pro_mcp import idalib_supervisor as supmod
+from ida_pro_mcp.server_metadata import MCP_PACKAGE_VERSION, MCP_SERVER_INSTRUCTIONS
 
 
 class _FakeProcess:
@@ -36,8 +39,8 @@ class _FakeSupervisor(supmod.IdalibSupervisor):
         self.opened: list[tuple[str, dict]] = []
         self.tool_calls: list[tuple[str, dict | None]] = []
 
-    def _spawn_worker(self):
-        return supmod.WorkerSession(
+    def _spawn_worker(self, *, on_spawn=None, cancel_event=None):
+        worker = supmod.WorkerSession(
             session_id="__schema__",
             input_path="",
             filename="",
@@ -45,6 +48,9 @@ class _FakeSupervisor(supmod.IdalibSupervisor):
             port=1,
             process=_FakeProcess(),
         )
+        if on_spawn is not None:
+            on_spawn(worker)
+        return worker
 
     def _worker_rpc(self, worker, payload, *, timeout=None):
         method = payload.get("method")
@@ -113,6 +119,80 @@ class _FakeSupervisor(supmod.IdalibSupervisor):
         }
 
 
+class _BlockingOpenSupervisor(_FakeSupervisor):
+    def __init__(self):
+        super().__init__()
+        self.open_started = threading.Event()
+        self.release_open = threading.Event()
+        self.spawn_count = 0
+        self.fail_open: Exception | None = None
+
+    def _spawn_worker(self, *, on_spawn=None, cancel_event=None):
+        self.spawn_count += 1
+        return super()._spawn_worker(
+            on_spawn=on_spawn,
+            cancel_event=cancel_event,
+        )
+
+    def call_worker_tool(
+        self,
+        worker,
+        name,
+        arguments=None,
+        *,
+        timeout=None,
+        cancel_event=None,
+        progress_callback=None,
+    ):
+        if name != "idb_open":
+            return super().call_worker_tool(worker, name, arguments, timeout=timeout)
+        assert arguments is not None
+        Path(arguments["input_path"] + ".id1").write_bytes(b"growing")
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "worker_pid": 12345,
+                    "state": "analyzing",
+                    "phase": "autoanalysis",
+                    "updated_at": "worker-heartbeat",
+                }
+            )
+        self.open_started.set()
+        while not self.release_open.wait(0.01):
+            if cancel_event is not None and cancel_event.is_set():
+                raise supmod.RequestCancelledError("Request was cancelled")
+        if self.fail_open is not None:
+            raise self.fail_open
+        return {
+            "success": True,
+            "session": {
+                "session_id": arguments["preferred_session_id"],
+                "input_path": arguments["input_path"],
+                "filename": Path(arguments["input_path"]).name,
+                "created_at": "now",
+                "last_accessed": "now",
+                "is_analyzing": False,
+                "metadata": {},
+            },
+            "warmup": {"ok": True, "steps": [], "health": {"status": "ok"}},
+        }
+
+
+class _SlowSpawnSupervisor(_FakeSupervisor):
+    def __init__(self):
+        super().__init__()
+        self.spawn_reported = threading.Event()
+
+    def _spawn_worker(self, *, on_spawn=None, cancel_event=None):
+        worker = super()._spawn_worker(on_spawn=on_spawn, cancel_event=cancel_event)
+        self.spawn_reported.set()
+        while cancel_event is not None and not cancel_event.wait(0.01):
+            pass
+        if cancel_event is not None and cancel_event.is_set():
+            raise supmod.RequestCancelledError("Request was cancelled")
+        return worker
+
+
 def _patch_discovery(*, instances, probe):
     old_discover = supmod._discovery.discover_instances
     old_probe = supmod._discovery.probe_instance
@@ -129,6 +209,20 @@ def _patch_discovery(*, instances, probe):
 def test_supervisor_import_does_not_import_ida_modules():
     assert "idapro" not in sys.modules
     assert "idaapi" not in sys.modules
+
+
+def test_supervisor_initialize_identity_and_instructions():
+    result = supmod.mcp._mcp_initialize(
+        protocolVersion="2025-06-18",
+        capabilities={},
+        clientInfo={"name": "test", "version": "1"},
+    )
+
+    assert result["serverInfo"] == {
+        "name": "ida-pro-mcp",
+        "version": MCP_PACKAGE_VERSION,
+    }
+    assert result["instructions"] == MCP_SERVER_INSTRUCTIONS
 
 
 def test_worker_rpc_default_has_no_socket_timeout(monkeypatch):
@@ -227,6 +321,54 @@ def test_open_session_cleans_new_parts_after_worker_failure(tmp_path):
     assert existing.read_bytes() == b"existing database state"
     assert not Path(str(sample) + ".id1").exists()
     assert packed.read_bytes() == b"packed database"
+
+
+def test_cancelled_open_reaps_worker_and_cleans_only_new_parts(tmp_path, monkeypatch):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"sample")
+    existing = Path(str(sample) + ".id0")
+    existing.write_bytes(b"existing database state")
+    cancel_event = threading.Event()
+    rpc_started = threading.Event()
+
+    class _CancellingSupervisor(_FakeSupervisor):
+        call_worker_tool = supmod.IdalibSupervisor.call_worker_tool
+
+        def _worker_rpc(self, worker, payload, *, timeout=None):
+            arguments = payload["params"]["arguments"]
+            Path(arguments["input_path"] + ".id1").write_bytes(b"incomplete")
+            rpc_started.set()
+            while worker.process.poll() is None:
+                time.sleep(0.01)
+            raise ConnectionResetError(10054, "worker reaped")
+
+    monkeypatch.setattr(supmod, "get_current_cancel_event", lambda: cancel_event)
+    restore = _patch_discovery(instances=[], probe=False)
+    try:
+        sup = _CancellingSupervisor()
+
+        def cancel_after_rpc_starts():
+            assert rpc_started.wait(2.0)
+            cancel_event.set()
+
+        canceller = threading.Thread(target=cancel_after_rpc_starts, daemon=True)
+        canceller.start()
+        with pytest.raises(supmod.RequestCancelledError, match="cancelled"):
+            sup.open_session(
+                str(sample),
+                mode="force_headless",
+                run_auto_analysis=False,
+                build_caches=False,
+                init_hexrays=False,
+            )
+        canceller.join(timeout=2.0)
+
+        assert existing.read_bytes() == b"existing database state"
+        assert not Path(str(sample) + ".id1").exists()
+        assert sup.sessions == {}
+        assert sup.path_to_session == {}
+    finally:
+        restore()
 
 
 def test_failed_gui_fallback_cleans_new_parts_after_worker_failure(tmp_path):
@@ -1155,6 +1297,160 @@ def test_idb_close_is_a_management_tool_symbol():
     assert callable(supmod.idb_close)
 
 
+def test_begin_open_returns_pending_promptly_and_is_idempotent(tmp_path):
+    sample = tmp_path / "slow.bin"
+    sample.write_bytes(b"slow")
+    sup = _BlockingOpenSupervisor()
+
+    started_at = time.monotonic()
+    first = sup.begin_open_session(str(sample), session_id="slow")
+    elapsed = time.monotonic() - started_at
+    assert elapsed < 0.25
+    assert first.session_id == "slow"
+    assert first.state in ("opening", "analyzing")
+    assert sup.open_started.wait(1.0)
+
+    same_path = sup.begin_open_session(str(sample), session_id="ignored")
+    same_id = sup.begin_open_session(str(sample), session_id="slow")
+    assert same_path is first
+    assert same_id is first
+    assert sup.spawn_count == 1
+
+    sup.release_open.set()
+    assert first.done_event.wait(1.0)
+    assert sup.open_status("slow")["state"] == "ready"
+
+
+def test_spawn_phase_exposes_launcher_and_can_be_cancelled(tmp_path):
+    sample = tmp_path / "spawn.bin"
+    sample.write_bytes(b"input")
+    sup = _SlowSpawnSupervisor()
+    operation = sup.begin_open_session(str(sample), session_id="spawn")
+    assert sup.spawn_reported.wait(1.0)
+
+    status = sup.open_status("spawn")
+    assert status["state"] == "opening"
+    assert status["phase"] == "spawn"
+    assert status["launcher_pid"] == 12345
+    assert status["worker_pid"] is None
+
+    cancelled = sup.cancel_open("spawn")
+    assert cancelled["state"] == "cancelled"
+    assert operation.done_event.is_set()
+
+
+def test_pending_open_rejects_same_session_id_for_different_path(tmp_path):
+    first_path = tmp_path / "first.bin"
+    second_path = tmp_path / "second.bin"
+    first_path.write_bytes(b"first")
+    second_path.write_bytes(b"second")
+    sup = _BlockingOpenSupervisor()
+    operation = sup.begin_open_session(str(first_path), session_id="shared")
+    assert sup.open_started.wait(1.0)
+
+    with pytest.raises(ValueError, match="Session already exists"):
+        sup.begin_open_session(str(second_path), session_id="shared")
+
+    sup.cancel_open("shared")
+    assert operation.done_event.is_set()
+
+
+def test_pending_open_status_and_list_expose_progress_and_growth(tmp_path):
+    sample = tmp_path / "growing.bin"
+    sample.write_bytes(b"input")
+    sup = _BlockingOpenSupervisor()
+    operation = sup.begin_open_session(str(sample), session_id="growing")
+    assert sup.open_started.wait(1.0)
+
+    status = sup.open_status("growing")
+    assert status["state"] == "analyzing"
+    assert status["phase"] == "autoanalysis"
+    assert status["worker_pid"] == 12345
+    assert status["idb_size_bytes"] == len(b"growing")
+    assert status["last_progress_at"]
+    assert status["last_heartbeat_at"]
+    assert status["terminal_error"] is None
+
+    listed = {entry["session_id"]: entry for entry in sup.list_sessions()}
+    assert listed["growing"]["pending"] is True
+    assert listed["growing"]["phase"] == "autoanalysis"
+
+    # A caller may lose the first response or apply its own timeout. Neither
+    # event reaches the operation cancel event, so the owned worker continues.
+    time.sleep(0.05)
+    assert not operation.cancel_event.is_set()
+    assert operation.worker is not None and operation.worker.is_alive()
+    sup.release_open.set()
+    assert operation.done_event.wait(1.0)
+    assert sup.open_status("growing")["state"] == "ready"
+
+
+def test_explicit_open_cancel_reaps_worker_and_preserves_existing_parts(tmp_path):
+    sample = tmp_path / "cancel.bin"
+    sample.write_bytes(b"input")
+    existing = Path(str(sample) + ".id0")
+    existing.write_bytes(b"existing")
+    sup = _BlockingOpenSupervisor()
+    operation = sup.begin_open_session(str(sample), session_id="cancel")
+    assert sup.open_started.wait(1.0)
+    assert Path(str(sample) + ".id1").exists()
+
+    status = sup.cancel_open("cancel")
+
+    assert status["state"] == "cancelled"
+    assert status["phase"] == "cancelled"
+    assert operation.worker is not None
+    assert operation.worker.process.returncode == 0
+    assert existing.read_bytes() == b"existing"
+    assert not Path(str(sample) + ".id1").exists()
+
+
+def test_open_failure_is_terminal_and_retry_allocates_once_requested(tmp_path):
+    sample = tmp_path / "failure.bin"
+    sample.write_bytes(b"input")
+    sup = _BlockingOpenSupervisor()
+    sup.fail_open = RuntimeError("analysis failed")
+    first = sup.begin_open_session(str(sample), session_id="failure")
+    assert sup.open_started.wait(1.0)
+    sup.release_open.set()
+    assert first.done_event.wait(1.0)
+    failed = sup.open_status("failure")
+    assert failed["state"] == "failed"
+    assert failed["phase"] == "failed"
+    assert failed["terminal_error"] == "analysis failed"
+
+    sup.open_started.clear()
+    sup.release_open.clear()
+    sup.fail_open = None
+    retry = sup.begin_open_session(str(sample), session_id="failure")
+    assert retry is not first
+    assert sup.open_started.wait(1.0)
+    assert sup.spawn_count == 2
+    sup.release_open.set()
+    assert retry.done_event.wait(1.0)
+    assert sup.open_status("failure")["state"] == "ready"
+
+
+def test_idb_open_tool_returns_operation_without_waiting_for_ready(tmp_path):
+    sample = tmp_path / "tool.bin"
+    sample.write_bytes(b"input")
+    old_supervisor = supmod.supervisor
+    sup = _BlockingOpenSupervisor()
+    supmod.supervisor = sup
+    try:
+        result = supmod.idb_open(str(sample), preferred_session_id="tool")
+        assert result["success"] is True
+        assert result["session_id"] == "tool"
+        assert result["state"] in ("opening", "analyzing")
+        assert result["operation"]["pending"] is True
+        assert "session" not in result
+        assert sup.open_started.wait(1.0)
+        sup.release_open.set()
+        assert sup.open_operations["tool"].done_event.wait(1.0)
+    finally:
+        supmod.supervisor = old_supervisor
+
+
 def test_supervisor_uses_idb_prefixed_management_tools_only():
     """No legacy names should leak into IDB_MANAGEMENT_TOOLS or module symbols."""
     legacy = {
@@ -1168,7 +1464,13 @@ def test_supervisor_uses_idb_prefixed_management_tools_only():
         "idalib_warmup",
         "idalib_health",
     }
-    assert supmod.IDB_MANAGEMENT_TOOLS == {"idb_open", "idb_list", "idb_close"}
+    assert supmod.IDB_MANAGEMENT_TOOLS == {
+        "idb_open",
+        "idb_open_status",
+        "idb_cancel_open",
+        "idb_list",
+        "idb_close",
+    }
     for name in legacy:
         assert not hasattr(supmod, name), f"{name} should have been deleted"
     for typename in ("IdalibWarmupResult", "IdalibHealthResult"):

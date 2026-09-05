@@ -37,6 +37,7 @@ from .utils import (
     get_function,
     normalize_dict_list,
     normalize_list_input,
+    require_bounded_batch,
     parse_address,
     paginate,
     pattern_filter,
@@ -54,9 +55,15 @@ class ServerHealthResult(TypedDict, total=False):
     input_path: str
     imagebase: str
     auto_analysis_ready: bool | None
+    auto_queue_empty: bool | None
+    auto_state: str | None
+    auto_state_id: int | None
+    auto_analysis_enabled: bool | None
     hexrays_ready: bool
     strings_cache_ready: bool
     strings_cache_size: int
+    ready: bool
+    not_ready_reasons: list[str]
     busy_tool: str
     busy_sec: float
     queued_calls: int
@@ -73,6 +80,14 @@ class ServerWarmupResult(TypedDict):
     ok: bool
     steps: list[ServerWarmupStep]
     health: ServerHealthResult
+
+
+class AnalysisBarrierResult(TypedDict):
+    ok: bool
+    cancelled: bool
+    wait_ms: float
+    before: ServerHealthResult
+    after: ServerHealthResult
 
 
 class LookupFuncResult(TypedDict):
@@ -356,9 +371,58 @@ def _apply_projection(items: list[dict], fields: list[str] | None) -> list[dict]
     return projected
 
 
-def _build_health_payload() -> dict:
+def _auto_state_name(state_id: int | None) -> str | None:
+    if state_id is None:
+        return None
+    for name in (
+        "AU_NONE",
+        "AU_UNK",
+        "AU_CODE",
+        "AU_WEAK",
+        "AU_PROC",
+        "AU_TAIL",
+        "AU_FCHUNK",
+        "AU_USED",
+        "AU_USD2",
+        "AU_TYPE",
+        "AU_LIBF",
+        "AU_LBF2",
+        "AU_LBF3",
+        "AU_CHLB",
+        "AU_FINAL",
+    ):
+        if int(getattr(ida_auto, name, -1)) == state_id:
+            return name
+    return f"UNKNOWN_{state_id}"
+
+
+def _auto_analysis_snapshot() -> dict[str, Any]:
     auto_is_ok = getattr(ida_auto, "auto_is_ok", None)
-    auto_analysis_ready = bool(auto_is_ok()) if callable(auto_is_ok) else None
+    queue_empty = bool(auto_is_ok()) if callable(auto_is_ok) else None
+
+    get_auto_state = getattr(ida_auto, "get_auto_state", None)
+    try:
+        state_id = int(get_auto_state()) if callable(get_auto_state) else None
+    except Exception:
+        state_id = None
+
+    is_auto_enabled = getattr(ida_auto, "is_auto_enabled", None)
+    try:
+        enabled = bool(is_auto_enabled()) if callable(is_auto_enabled) else None
+    except Exception:
+        enabled = None
+
+    return {
+        "auto_analysis_ready": queue_empty,
+        "auto_queue_empty": queue_empty,
+        "auto_state": _auto_state_name(state_id),
+        "auto_state_id": state_id,
+        "auto_analysis_enabled": enabled,
+    }
+
+
+def _build_health_payload() -> dict:
+    auto = _auto_analysis_snapshot()
 
     hexrays_ready = False
     try:
@@ -372,6 +436,19 @@ def _build_health_payload() -> dict:
     except Exception:
         idb_path = None
 
+    not_ready_reasons = []
+    if auto["auto_queue_empty"] is not True:
+        reason = (
+            "auto-analysis-queue-not-empty"
+            if auto["auto_queue_empty"] is False
+            else "auto-analysis-status-unavailable"
+        )
+        not_ready_reasons.append(reason)
+    if not hexrays_ready:
+        not_ready_reasons.append("hexrays-unavailable")
+    if _strings_cache is None:
+        not_ready_reasons.append("strings-cache-uninitialized")
+
     return {
         "status": "ok",
         "uptime_sec": round(time.time() - _server_started_at, 3),
@@ -379,10 +456,12 @@ def _build_health_payload() -> dict:
         "module": ida_nalt.get_root_filename(),
         "input_path": ida_nalt.get_input_file_path(),
         "imagebase": hex(idaapi.get_imagebase()),
-        "auto_analysis_ready": auto_analysis_ready,
+        **auto,
         "hexrays_ready": hexrays_ready,
         "strings_cache_ready": _strings_cache is not None,
         "strings_cache_size": len(_strings_cache) if _strings_cache is not None else 0,
+        "ready": not not_ready_reasons,
+        "not_ready_reasons": not_ready_reasons,
     }
 
 
@@ -393,7 +472,7 @@ def _server_health_full() -> ServerHealthResult:
 
 @tool
 def server_health() -> ServerHealthResult:
-    """Health/ready probe for MCP server and current IDB state."""
+    """Health/readiness probe; ``status=ok`` means transport, not full readiness."""
     # Every field below needs the IDA main thread. Report the busy state
     # rather than queueing behind the very call we are meant to observe.
     busy = get_pump().busy_status()
@@ -406,6 +485,30 @@ def server_health() -> ServerHealthResult:
             "queued_calls": busy["queued"],
         }
     return _server_health_full()
+
+
+@tool
+@idasync
+def analysis_barrier() -> AnalysisBarrierResult:
+    """Drain pending auto-analysis queues and return before/after readiness.
+
+    This is an explicit synchronization boundary for callers that need a
+    stable final readiness check. It does not rename, patch, or apply analyst
+    types. The enclosing MCP tool timeout remains the operation bound.
+    """
+
+    before = _build_health_payload()
+    t0 = time.perf_counter()
+    completed = bool(ida_auto.auto_wait())
+    wait_ms = round((time.perf_counter() - t0) * 1000, 2)
+    after = _build_health_payload()
+    return {
+        "ok": completed and after.get("auto_queue_empty") is True,
+        "cancelled": not completed,
+        "wait_ms": wait_ms,
+        "before": before,
+        "after": after,
+    }
 
 
 @idasync
@@ -461,19 +564,20 @@ def server_warmup(
 @tool
 @idasync
 def lookup_funcs(
-    queries: Annotated[list[str] | str, "Address(es) or name(s)"],
+    queries: Annotated[list[str], "Address(es) or name(s)"],
 ) -> list[LookupFuncResult]:
     """Get functions by address or name (auto-detects)"""
-    queries = normalize_list_input(queries)
+    queries = require_bounded_batch(normalize_list_input(queries), "lookup_funcs")
 
-    # Treat empty/"*" as "all functions" - but add limit
+    # Broad enumeration has no continuation cursor; entity_query owns that path.
     if not queries or (len(queries) == 1 and queries[0] in ("*", "")):
-        all_funcs = []
-        for addr in idautils.Functions():
-            all_funcs.append(get_function(addr))
-            if len(all_funcs) >= 1000:
-                break
-        return [{"query": "*", "fn": fn, "error": None} for fn in all_funcs]
+        return [
+            {
+                "query": "*",
+                "fn": None,
+                "error": "Wildcard enumeration is disabled; use entity_query pagination",
+            }
+        ]
 
     results = []
     for query in queries:
@@ -715,12 +819,12 @@ def list_globals(
 @idasync
 def entity_query(
     queries: Annotated[
-        list[EntityQuery] | EntityQuery,
+        list[EntityQuery],
         "Generic entity query with filtering, projection, and pagination",
     ],
 ) -> list[EntityQueryPage]:
     """Query IDB entities with typed filters, projection, and pagination."""
-    queries = normalize_dict_list(queries)
+    queries = require_bounded_batch(normalize_dict_list(queries), "entity_query")
     results: list[dict] = []
 
     for query in queries:
@@ -787,8 +891,8 @@ def entity_query(
         else:
             rows.sort(key=lambda row: str(row.get(sort_by, "")).lower(), reverse=descending)
 
-        offset = int(query.get("offset", 0) or 0)
-        count = int(query.get("count", 100) or 100)
+        offset = max(0, int(query.get("offset", 0) or 0))
+        count = min(512, max(1, int(query.get("count", 64) or 64)))
         page = paginate(rows, offset, count)
         data = [{k: v for k, v in item.items() if k != "size_int"} for item in page["data"]]
 
@@ -894,14 +998,14 @@ def idb_save(
 @idasync
 def find_regex(
     pattern: Annotated[str, "Regex pattern to search for in strings"],
-    limit: Annotated[int, "Max matches (default: 30, max: 500)"] = 30,
+    limit: Annotated[int, "Max matches (default: 30, max: 200)"] = 30,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> FindRegexResult:
     """Search strings by case-insensitive regex with offset/limit pagination."""
     if limit <= 0:
         limit = 30
-    if limit > 500:
-        limit = 500
+    if limit > 200:
+        limit = 200
 
     matches = []
     regex = re.compile(pattern, re.IGNORECASE)

@@ -20,6 +20,7 @@ from .utils import (
     parse_address,
     normalize_list_input,
     normalize_dict_list,
+    require_bounded_batch,
     get_function,
     get_prototype,
     paginate,
@@ -49,17 +50,22 @@ from .utils import (
 from . import compat
 
 
-class DecompileResult(TypedDict):
-    addr: str
-    code: str | None
-    refs: NotRequired[list[Ref]]
-    error: NotRequired[str]
-
-
 class ResultCursor(TypedDict, total=False):
     next: int
     done: bool
     cancelled: bool
+
+
+class DecompileResult(TypedDict):
+    addr: str
+    code: str | None
+    line_count: int
+    total_lines: int
+    cursor: ResultCursor
+    refs: NotRequired[list[Ref]]
+    refs_count: NotRequired[int]
+    refs_truncated: NotRequired[bool]
+    error: NotRequired[str]
 
 
 class DisasmResult(TypedDict, total=False):
@@ -125,6 +131,9 @@ class AnalyzeBatchDetails(TypedDict, total=False):
     prototype: str | None
     decompile: str | None
     decompile_error: str | None
+    decompile_line_count: int
+    decompile_total_lines: int
+    decompile_truncated: bool
     disasm: AnalyzeBatchDisasm | None
     xrefs: AnalyzeBatchXrefs | None
     callers: list[dict[str, Any]] | None
@@ -191,6 +200,8 @@ class StructFieldXrefsResult(TypedDict, total=False):
     struct: str
     field: str
     xrefs: list[Xref]
+    xref_count: int
+    truncated: bool
     message: str
     error: str
 
@@ -758,28 +769,58 @@ def decompile(
     include_addresses: Annotated[
         bool, "Append /*0xNNNN*/ markers per line (default: true). Set false to save tokens."
     ] = True,
+    offset: Annotated[int, "Skip first N pseudocode lines (default: 0)"] = 0,
+    max_lines: Annotated[int, "Max pseudocode lines (default: 200, max: 1000)"] = 200,
 ) -> DecompileResult:
-    """Decompile function(s) at address(es); returns pseudocode and per-item errors."""
+    """Decompile a bounded pseudocode page with explicit continuation metadata."""
+    offset = _clamp_int(offset, 0, 0, 2_000_000_000)
+    max_lines = _clamp_int(max_lines, 200, 1, 1000)
     try:
         start = parse_address(addr)
         code, err = decompile_function_safe(start, include_addresses=include_addresses)
         if code is None:
-            return {"addr": addr, "code": None, "error": err or "Decompilation failed"}
-        result: DecompileResult = {"addr": addr, "code": code}
+            return {
+                "addr": addr,
+                "code": None,
+                "line_count": 0,
+                "total_lines": 0,
+                "cursor": {"done": True},
+                "error": err or "Decompilation failed",
+            }
+        lines = code.splitlines()
+        page = lines[offset : offset + max_lines]
+        more = offset + len(page) < len(lines)
+        result: DecompileResult = {
+            "addr": addr,
+            "code": "\n".join(page),
+            "line_count": len(page),
+            "total_lines": len(lines),
+            "cursor": {"next": offset + len(page)} if more else {"done": True},
+        }
         try:
             import ida_hexrays
 
             if ida_hexrays.init_hexrays_plugin():
                 cfunc = ida_hexrays.decompile(start)
                 if cfunc:
-                    refs = _collect_decompile_refs(cfunc)
+                    all_refs = _collect_decompile_refs(cfunc)
+                    refs = all_refs[:128]
                     if refs:
                         result["refs"] = refs
+                    result["refs_count"] = len(all_refs)
+                    result["refs_truncated"] = len(all_refs) > len(refs)
         except Exception:
             pass
         return result
     except Exception as e:
-        return {"addr": addr, "code": None, "error": str(e)}
+        return {
+            "addr": addr,
+            "code": None,
+            "line_count": 0,
+            "total_lines": 0,
+            "cursor": {"done": True},
+            "error": str(e),
+        }
 
 
 @tool
@@ -788,8 +829,8 @@ def decompile(
 def disasm(
     addr: Annotated[str, "Function address or name to disassemble"],
     max_instructions: Annotated[
-        int, "Max instructions per function (default: 5000, max: 50000)"
-    ] = 5000,
+        int, "Max instructions per function (default: 256, max: 2048)"
+    ] = 256,
     offset: Annotated[int, "Skip first N instructions (default: 0)"] = 0,
     include_total: Annotated[
         bool, "Compute total instruction count (default: false)"
@@ -798,8 +839,10 @@ def disasm(
     """Disassemble function with offset/max_instructions pagination and optional total count."""
 
     # Enforce max limit
-    if max_instructions <= 0 or max_instructions > 50000:
-        max_instructions = 50000
+    if max_instructions <= 0:
+        max_instructions = 256
+    if max_instructions > 2048:
+        max_instructions = 2048
     if offset < 0:
         offset = 0
 
@@ -1043,12 +1086,14 @@ def func_profile(
 @tool_timeout(120.0)
 def analyze_batch(
     queries: Annotated[
-        list[AnalyzeBatchQuery] | AnalyzeBatchQuery,
-        "Comprehensive per-function analysis with selectable sections",
+        list[AnalyzeBatchQuery],
+        "Cheap function survey; enable decompilation or other sections explicitly",
     ],
 ) -> list[AnalyzeBatchResult]:
-    """Run comprehensive analysis over one or more target functions."""
-    queries = normalize_dict_list(queries)
+    """Survey functions and return only explicitly enabled analysis sections."""
+    queries = require_bounded_batch(
+        normalize_dict_list(queries), "analyze_batch", maximum=8
+    )
 
     results: list[dict] = []
     for query in queries:
@@ -1086,59 +1131,55 @@ def analyze_batch(
             fn_name = ida_funcs.get_func_name(fn.start_ea) or "<unnamed>"
             size_int = fn.end_ea - fn.start_ea
 
-            include_decompile = bool(query.get("include_decompile", True))
+            include_decompile = bool(query.get("include_decompile", False))
             include_disasm = bool(query.get("include_disasm", False))
-            include_xrefs = bool(query.get("include_xrefs", True))
-            include_callers = bool(query.get("include_callers", True))
-            include_callees = bool(query.get("include_callees", True))
-            include_strings = bool(query.get("include_strings", True))
-            include_constants = bool(query.get("include_constants", True))
-            include_basic_blocks = bool(query.get("include_basic_blocks", True))
+            include_xrefs = bool(query.get("include_xrefs", False))
+            include_callers = bool(query.get("include_callers", False))
+            include_callees = bool(query.get("include_callees", False))
+            include_strings = bool(query.get("include_strings", False))
+            include_constants = bool(query.get("include_constants", False))
+            include_basic_blocks = bool(query.get("include_basic_blocks", False))
             include_proto = bool(query.get("include_proto", True))
 
+            max_decompile_lines = _clamp_int(
+                query.get("max_decompile_lines", 200), 200, 1, 1000
+            )
             max_disasm_insns = _clamp_int(
-                query.get("max_disasm_insns", 300), 300, 0, 50_000
+                query.get("max_disasm_insns", 256), 256, 0, 2048
             )
-            max_callers = _clamp_int(query.get("max_callers", 100), 100, 0, 5000)
-            max_callees = _clamp_int(query.get("max_callees", 100), 100, 0, 5000)
-            max_strings = _clamp_int(query.get("max_strings", 100), 100, 0, 5000)
+            max_callers = _clamp_int(query.get("max_callers", 64), 64, 0, 512)
+            max_callees = _clamp_int(query.get("max_callees", 64), 64, 0, 512)
+            max_strings = _clamp_int(query.get("max_strings", 64), 64, 0, 512)
             max_constants = _clamp_int(
-                query.get("max_constants", 200), 200, 0, 10000
+                query.get("max_constants", 128), 128, 0, 1024
             )
-            max_blocks = _clamp_int(query.get("max_blocks", 500), 500, 0, 10000)
+            max_blocks = _clamp_int(query.get("max_blocks", 256), 256, 0, 2048)
 
-            analysis: dict = {
-                "size": hex(size_int),
-                "prototype": None,
-                "decompile": None,
-                "decompile_error": None,
-                "disasm": None,
-                "xrefs": None,
-                "callers": None,
-                "caller_count": 0,
-                "callers_truncated": False,
-                "callees": None,
-                "callee_count": 0,
-                "callees_truncated": False,
-                "strings": None,
-                "string_ref_count": 0,
-                "strings_truncated": False,
-                "constants": None,
-                "constant_count": 0,
-                "constants_truncated": False,
-                "basic_blocks": None,
-                "basic_block_count": 0,
-                "basic_blocks_truncated": False,
-            }
+            analysis: dict = {"size": hex(size_int)}
 
             if include_proto:
                 analysis["prototype"] = get_prototype(fn)
 
             if include_decompile:
+                analysis.update(
+                    {
+                        "decompile": None,
+                        "decompile_error": None,
+                        "decompile_line_count": 0,
+                        "decompile_total_lines": 0,
+                        "decompile_truncated": False,
+                    }
+                )
                 code, err = decompile_function_safe(fn.start_ea)
-                analysis["decompile"] = code
                 if code is None:
                     analysis["decompile_error"] = err or "Decompilation failed"
+                else:
+                    decompile_lines = code.splitlines()
+                    page = decompile_lines[:max_decompile_lines]
+                    analysis["decompile"] = "\n".join(page)
+                    analysis["decompile_line_count"] = len(page)
+                    analysis["decompile_total_lines"] = len(decompile_lines)
+                    analysis["decompile_truncated"] = len(page) < len(decompile_lines)
 
             if include_disasm:
                 lines, disasm_truncated = _disasm_lines_limited(fn, max_disasm_insns)
@@ -1152,8 +1193,8 @@ def analyze_batch(
                 xrefs = get_all_xrefs(fn.start_ea)
                 xrefs_to = list(xrefs.get("to", []))
                 xrefs_from = list(xrefs.get("from", []))
-                xrefs_to, xto_trunc = _limit_items(xrefs_to, 200)
-                xrefs_from, xfrom_trunc = _limit_items(xrefs_from, 200)
+                xrefs_to, xto_trunc = _limit_items(xrefs_to, 64)
+                xrefs_from, xfrom_trunc = _limit_items(xrefs_from, 64)
                 analysis["xrefs"] = {
                     "to": xrefs_to,
                     "from": xrefs_from,
@@ -1289,12 +1330,12 @@ def xrefs_to(
 @idasync
 def xref_query(
     queries: Annotated[
-        list[XrefQuery] | XrefQuery,
+        list[XrefQuery],
         "Generic xref query with direction/type filters and pagination",
     ],
 ) -> list[XrefQueryResult]:
     """Query xrefs with direction/type filters and pagination."""
-    queries = normalize_dict_list(queries)
+    queries = require_bounded_batch(normalize_dict_list(queries), "xref_query")
 
     results: list[dict] = []
     for query in queries:
@@ -1302,7 +1343,7 @@ def xref_query(
         direction = str(query.get("direction", "both") or "both").lower()
         xref_type = str(query.get("xref_type", "any") or "any").lower()
         offset = _clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
-        count = _clamp_int(query.get("count", 200), 200, 0, 5000)
+        count = _clamp_int(query.get("count", 64), 64, 1, 512)
         include_fn = bool(query.get("include_fn", True))
         dedup = bool(query.get("dedup", True))
         sort_by = str(query.get("sort_by", "addr") or "addr")
@@ -1412,11 +1453,12 @@ def xref_query(
 @tool
 @idasync
 def xrefs_to_field(
-    queries: list[StructFieldQuery] | StructFieldQuery,
+    queries: list[StructFieldQuery],
 ) -> list[StructFieldXrefsResult]:
     """Get cross-references to structure fields"""
     if isinstance(queries, dict):
         queries = [queries]
+    queries = require_bounded_batch(queries, "xrefs_to_field")
 
     results = []
     til = ida_typeinf.get_idati()
@@ -1475,19 +1517,24 @@ def xrefs_to_field(
                 continue
 
             xrefs = []
+            total_xrefs = 0
             xref: ida_xref.xrefblk_t
             for xref in idautils.XrefsTo(tid):
-                xrefs += [
-                    Xref(
-                        addr=hex(xref.frm),
-                        type="code" if xref.iscode else "data",
-                        fn=get_function(xref.frm, raise_error=False),
+                total_xrefs += 1
+                if len(xrefs) < 512:
+                    xrefs.append(
+                        Xref(
+                            addr=hex(xref.frm),
+                            type="code" if xref.iscode else "data",
+                            fn=get_function(xref.frm, raise_error=False),
+                        )
                     )
-                ]
             field_result: StructFieldXrefsResult = {
                 "struct": struct_name,
                 "field": field_name,
                 "xrefs": xrefs,
+                "xref_count": total_xrefs,
+                "truncated": total_xrefs > len(xrefs),
             }
             if not xrefs:
                 field_result["message"] = "No cross-references to this struct field"
@@ -1776,18 +1823,21 @@ def find(
         str, "Search type: 'string', 'immediate', 'data_ref', or 'code_ref'"
     ],
     targets: Annotated[
-        list[str | int] | str | int, "Search targets (strings, integers, or addresses)"
+        list[str | int], "Search targets (strings, integers, or addresses)"
     ],
-    limit: Annotated[int, "Max matches per target (default: 1000, max: 10000)"] = 1000,
+    limit: Annotated[int, "Max matches per target (default: 64, max: 512)"] = 64,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> list[FindResult]:
     """Search strings/immediates/refs for targets with offset/limit pagination."""
     if not isinstance(targets, list):
         targets = [targets]
+    targets = require_bounded_batch(targets, "find")
 
     # Enforce max limit to prevent token overflow
-    if limit <= 0 or limit > 10000:
-        limit = 10000
+    if limit <= 0:
+        limit = 64
+    if limit > 512:
+        limit = 512
 
     results = []
 
@@ -2164,12 +2214,12 @@ def _scan_insn_ranges(
 @idasync
 def insn_query(
     queries: Annotated[
-        list[InsnPattern] | InsnPattern,
+        list[InsnPattern],
         "Instruction query with mnemonic/operand filters and scoped scan",
     ],
 ) -> list[InsnQueryResult]:
     """Query instructions with mnemonic/operand filters and scoped scans."""
-    queries = normalize_dict_list(queries)
+    queries = require_bounded_batch(normalize_dict_list(queries), "insn_query")
 
     results: list[dict] = []
     for pattern in queries:
@@ -2178,9 +2228,9 @@ def insn_query(
             mnem = ""
 
         offset = _clamp_int(pattern.get("offset", 0), 0, 0, 2_000_000_000)
-        count = _clamp_int(pattern.get("count", 100), 100, 0, 5000)
+        count = _clamp_int(pattern.get("count", 64), 64, 1, 512)
         max_scan_insns = _clamp_int(
-            pattern.get("max_scan_insns", 200000), 200000, 1, 2_000_000
+            pattern.get("max_scan_insns", 50000), 50000, 1, 250_000
         )
         allow_broad = bool(pattern.get("allow_broad", False))
         include_fn = bool(pattern.get("include_fn", False))

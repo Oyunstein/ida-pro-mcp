@@ -13,6 +13,7 @@ from .sync import idasync
 from .utils import (
     normalize_list_input,
     normalize_dict_list,
+    require_bounded_batch,
     paginate,
     pattern_filter,
     parse_address,
@@ -336,11 +337,11 @@ def _parse_enum_value(value: int | str | None) -> int:
 @tool
 @idasync
 def read_struct(
-    queries: list[StructRead] | StructRead,
+    queries: list[StructRead],
 ) -> list[ReadStructResult]:
     """Read struct fields from memory at address; auto-detect type when possible."""
 
-    queries = normalize_dict_list(queries)
+    queries = require_bounded_batch(normalize_dict_list(queries), "read_struct")
 
     results = []
     for query in queries:

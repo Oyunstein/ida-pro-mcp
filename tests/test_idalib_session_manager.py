@@ -144,3 +144,16 @@ def test_close_all_sessions_invalidates_strings_cache(session_env, tmp_path):
     session_env.manager.close_all_sessions()
 
     assert session_env.spy.invalidations >= 1
+
+
+def test_open_binary_reports_open_and_autoanalysis_phases(session_env, tmp_path):
+    binary = _make_binary(tmp_path, "progress.bin")
+    phases = []
+
+    session_env.manager.open_binary(
+        binary,
+        run_auto_analysis=True,
+        progress_callback=phases.append,
+    )
+
+    assert phases == ["open", "autoanalysis"]

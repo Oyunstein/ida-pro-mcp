@@ -57,6 +57,22 @@ class InitializeEndpointTests(unittest.TestCase):
         result = self._initialize("2024-11-05")
         self.assertRegex(result["protocolVersion"], r"^\d{4}-\d{2}-\d{2}$")
 
+    def test_initialize_returns_configured_server_instructions(self):
+        instructions = "Use absolute paths and close every session."
+        self.srv = McpServer(
+            "test-server", version="3.2.1", instructions=instructions
+        )
+
+        result = self._initialize()
+
+        self.assertEqual(result["instructions"], instructions)
+        assert_schema(result, INITIALIZE_RESULT_SCHEMA)
+
+    def test_initialize_omits_empty_server_instructions(self):
+        result = self._initialize()
+
+        self.assertNotIn("instructions", result)
+
 
 class PingEndpointTests(unittest.TestCase):
     def test_ping_returns_empty_object(self):

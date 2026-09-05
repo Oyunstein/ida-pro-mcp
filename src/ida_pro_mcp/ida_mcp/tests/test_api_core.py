@@ -26,6 +26,7 @@ from ..api_core import (
     entity_query,
     imports,
     imports_query,
+    analysis_barrier,
     server_health,
     server_warmup,
     find_regex,
@@ -91,24 +92,23 @@ def test_lookup_funcs_invalid():
 
 
 @test()
-def test_lookup_funcs_wildcard_returns_non_empty_function_list():
-    """lookup_funcs('*') returns a non-empty list of valid functions."""
+def test_lookup_funcs_wildcard_requires_paginated_entity_query():
+    """lookup_funcs('*') rejects an unpaged whole-program response."""
     result = lookup_funcs("*")
-    assert_is_list(result, min_length=1)
-    for item in result:
-        assert item["query"] == "*"
-        assert_ok(item, "fn")
-        assert_shape(item["fn"], Function)
+    assert result == [
+        {
+            "query": "*",
+            "fn": None,
+            "error": "Wildcard enumeration is disabled; use entity_query pagination",
+        }
+    ]
 
 
 @test()
-def test_lookup_funcs_empty_returns_non_empty_function_list():
-    """lookup_funcs('') behaves like an all-functions query and must not be empty."""
+def test_lookup_funcs_empty_requires_paginated_entity_query():
+    """lookup_funcs('') rejects an unpaged whole-program response."""
     result = lookup_funcs("")
-    assert_is_list(result, min_length=1)
-    for item in result:
-        assert item["query"] == "*"
-        assert_ok(item, "fn")
+    assert_error(result[0], contains="entity_query pagination")
 
 
 @test()
@@ -421,7 +421,21 @@ def test_server_health():
         "imagebase",
         "strings_cache_ready",
         "hexrays_ready",
+        "auto_queue_empty",
+        "auto_state",
+        "auto_state_id",
+        "auto_analysis_enabled",
+        "ready",
+        "not_ready_reasons",
     )
+
+
+@test()
+def test_analysis_barrier():
+    """analysis_barrier returns bounded before/after readiness evidence"""
+    result = analysis_barrier()
+    assert_has_keys(result, "ok", "cancelled", "wait_ms", "before", "after")
+    assert result["after"]["auto_queue_empty"] is True
 
 
 @test()
